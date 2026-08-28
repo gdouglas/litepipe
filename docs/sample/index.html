@@ -766,7 +766,6 @@ async function openWorkflow(name) {
   const clip = fileHref(name, "clip.mp4");
   if (!$("#v").src.endsWith(clip)) $("#v").src = clip;
   $("#total").textContent = clock(m.duration_seconds || 0);
-  $("#framecount").textContent = `${WF.frames.length.toLocaleString()} frames with events`;
   $("#notecount").textContent = `Narration ${WF.narration.length.toLocaleString()}`;
 
   renderTask();
@@ -811,8 +810,31 @@ function describe(e) {
   return "";
 }
 
-function renderFrames() {
-  $("#frames").innerHTML = WF.frames.map(f => `
+// A window, not the whole stream. An hour of capture is 61,519 frames, and
+// building them all put 943,569 nodes in a panel that shows fifteen — which
+// cost seconds on load and made playback crawl, because the loop that marks
+// the current row walks every one of them thirty times a second.
+const FRAME_ROWS = 400;
+let frameWindow = { from: -1, to: -1 };
+
+/// The last row at or before a clip frame.
+function frameIndexAt(f) {
+  let lo = 0, hi = WF.frames.length - 1, best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (WF.frames[mid].frame <= f) { best = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return best;
+}
+
+function renderFrames(centre = 0) {
+  const half = FRAME_ROWS >> 1;
+  const from = Math.max(0, Math.min(frameIndexAt(centre) - half,
+                                    WF.frames.length - FRAME_ROWS));
+  const to = Math.min(WF.frames.length, from + FRAME_ROWS);
+  if (from === frameWindow.from && to === frameWindow.to) return;
+  frameWindow = { from, to };
+  $("#frames").innerHTML = WF.frames.slice(from, to).map(f => `
     <div class="flex cursor-pointer flex-col gap-1 rounded border-l-2 px-2 py-1.5 text-xs hoverable"
          data-frame="${f.frame}">
       <div class="flex items-center gap-2">
@@ -830,6 +852,11 @@ function renderFrames() {
       </div>
     </div>`).join("");
   wireSeek("#frames");
+  // Said, not implied: a list that stops at four hundred rows without saying
+  // so reads as a recording that stops there.
+  $("#framecount").textContent =
+    `${WF.frames.length.toLocaleString()} frames with events · `
+    + `${(from + 1).toLocaleString()}–${to.toLocaleString()} shown`;
 }
 
 function renderNotes() {
@@ -1182,6 +1209,8 @@ video.addEventListener("timeupdate", () => {
     const top = hit.offsetTop - root.offsetTop - 8;
     if (Math.abs(root.scrollTop - top) > 4) root.scrollTop = top;
   };
+  const i = frameIndexAt(f);
+  if (i < frameWindow.from + 100 || i > frameWindow.to - 100) renderFrames(f);
   mark($("#frames"), follow.frames);
   mark($("#notes"), follow.notes);
 });

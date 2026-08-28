@@ -23,8 +23,6 @@
   .demo { border: 1px solid var(--foreground); border-radius: .375rem;
           padding: .1rem .45rem; font-size: .6875rem; font-weight: 600;
           letter-spacing: .04em; text-transform: uppercase; }
-  .demo-note { color: var(--muted-foreground); font-size: .75rem; }
-  a.demo-note:hover { color: var(--foreground); }
   .action { border: 1px solid var(--border); background: var(--card); color: var(--foreground);
             border-radius: .5rem; padding: .45rem 1rem; font-family: var(--font-ui);
             font-size: .8125rem; font-weight: 500;
@@ -226,7 +224,6 @@
     <span class="brand">litecap</span>
     <button class="action hidden" id="back">← All sessions</button>
     <span class="demo hidden" id="demo">Demo</span>
-    <span class="demo-note hidden" id="demonote">One recorded session, read&#8209;only</span>
     <span class="grow"></span>
     <span id="live" class="flex items-center gap-2 hidden">
       <span class="dotlive"></span>
@@ -236,7 +233,6 @@
            to know which. -->
       <span class="text-xs text-muted-foreground" id="filming"></span>
     </span>
-    <a class="demo-note hidden" id="demolink" href="https://litepipe.ai">litepipe.ai&nbsp;↗</a>
     <select id="display"></select>
     <button class="action rec" id="rec">Record</button>
     <button class="action hidden" id="save">Save session</button>
@@ -258,9 +254,6 @@
     <div class="chips" id="wf-chips"></div>
     <div id="wf-warn"></div>
 
-    <div class="flex items-center gap-2" style="margin-bottom:.75rem">
-      <span id="privacy" class="text-xs"></span>
-    </div>
 
     <h2 class="sect" id="tasklabel">The task</h2>
     <div class="card task hidden" id="taskcard">
@@ -767,7 +760,7 @@ async function openWorkflow(name) {
   $("#framecount").textContent = `${WF.frames.length.toLocaleString()} frames with events`;
   $("#notecount").textContent = `Narration ${WF.narration.length.toLocaleString()}`;
 
-  renderPrivacy(); renderTask();
+  renderTask();
   renderFrames(); renderNotes(); renderSteps(); renderHist();
   renderLayers(); renderLogs(); renderTree(name);
 
@@ -779,21 +772,6 @@ async function openWorkflow(name) {
   showTab("clip");
 }
 
-// The state is deliberately three-valued and never says "clean": text can be
-// reviewed while the video has not been looked at once, and a single word for
-// both would be the misleading half of the claim.
-function renderPrivacy() {
-  const m = WF.metadata;
-  const bits = [];
-  bits.push(m.text_reviewed
-    ? `<span style="color:var(--emerald)">✓ text reviewed</span>` +
-      (m.text_redaction?.spans ? ` <span class="text-muted-foreground">(${m.text_redaction.spans} spans covered)</span>` : "")
-    : `<span style="color:var(--amber)">⚠ text not reviewed</span>`);
-  bits.push(m.video_reviewed
-    ? `<span style="color:var(--emerald)">✓ video reviewed</span>`
-    : `<span style="color:var(--amber)">⚠ video not reviewed</span>`);
-  $("#privacy").innerHTML = bits.join(" &nbsp;·&nbsp; ");
-}
 
 const kindColour = k => ["click", "click_release", "scroll", "move", "text", "key",
   "app_switch", "window_focus", "drag", "type"].includes(k) ? `c-${k}` : "c-default";
@@ -1232,8 +1210,7 @@ function displayName(d, all) {
     // a page nobody can record from is a lie about what it is.
     for (const id of ["#rec", "#save", "#display", "#live", "#savenotes"])
       $(id)?.classList.add("hidden");
-    for (const id of ["#demo", "#demonote", "#demolink"])
-      $(id)?.classList.remove("hidden");
+    $("#demo")?.classList.remove("hidden");
     await loadLibrary();
     // One workflow is the sample itself; open it rather than making the
     // reader click a list of one.

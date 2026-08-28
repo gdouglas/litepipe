@@ -670,13 +670,20 @@ $("#back").onclick = () => {
 // to settle, which is the whole difference this format exists to make.
 function renderTask() {
   const t = WF.task_desc || {}, rubrics = WF.rubrics || [];
-  $("#taskcard").classList.remove("hidden");
+  const deliverables = t.deliverables || [];
+
+  // Nothing to judge against and nothing to hand over: what is left is the
+  // title, which is already at the top of the page. A section that exists to
+  // say it is empty is worse than no section.
+  const worth = rubrics.length || deliverables.length;
+  $("#taskcard").classList.toggle("hidden", !worth);
+  $("#tasklabel").classList.toggle("hidden", !worth);
+  if (!worth) return;
 
   $("#taskdesc").innerHTML = t.description
     ? esc(t.description)
     : `<span class="missing">No description was written for this session.</span>`;
 
-  const deliverables = t.deliverables || [];
   $("#deliv").innerHTML = deliverables.map(d =>
     `<div><b>${esc(d.type || d.format || "Deliverable")}</b>${
       d.description ? ` — ${esc(d.description)}` : ""}</div>`).join("");

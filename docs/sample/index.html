@@ -768,15 +768,19 @@ async function openWorkflow(name) {
   $("#total").textContent = clock(m.duration_seconds || 0);
   $("#notecount").textContent = `Narration ${WF.narration.length.toLocaleString()}`;
 
+  // Only what the first tab shows. The other three between them were four
+  // fifths of the page's nodes, built for a reader who had not clicked them.
   renderTask();
-  renderFrames(); renderNotes(); renderSteps(); renderHist();
-  renderLayers(); renderLogs(); renderTree(name);
+  renderFrames(); renderNotes(); renderHist();
+  // The tree stays on load: it is a hundred nodes, and the task section's
+  // reference images are found in it.
+  renderTree(name);
+  BUILT.clear();
 
   // The notes arrive after the session is saved, so the page comes back for
   // them rather than making somebody reload to find out.
   if (WF.describing?.state === "running")
     WATCH = setTimeout(() => watchNarration(name), 2500);
-  await loadSegments();
   showTab("clip");
 }
 
@@ -1116,11 +1120,20 @@ async function openFile(path, bytes) {
 }
 
 // ── tabs, playback, trail ────────────────────────────────────────────────
-function showTab(which) {
+// A tab builds itself the first time it is opened, and stays built.
+const BUILT = new Set();
+
+async function showTab(which) {
   for (const t of document.querySelectorAll(".tab"))
     t.ariaSelected = String(t.dataset.tab === which);
   for (const id of ["clip", "data", "traj", "narr", "logs"])
     $(`#tab-${id}`).classList.toggle("hidden", id !== which);
+
+  if (!WF || BUILT.has(which)) return;
+  BUILT.add(which);
+  if (which === "traj") renderSteps();
+  else if (which === "logs") { renderLayers(); renderLogs(); }
+  else if (which === "narr") await loadSegments();
 }
 for (const t of document.querySelectorAll(".tab")) t.onclick = () => showTab(t.dataset.tab);
 

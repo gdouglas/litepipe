@@ -2038,6 +2038,41 @@ const BROWSER_NAMES: &[&str] = &[
 /// URL patterns. This catches browser meetings even when the meeting tab
 /// is not the active tab (AXDocument still reflects tab URL on most browsers).
 ///
+/// Pids of every running process, read from the kernel on each call.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<i32> {
+    let mut pids = vec![0i32; 8192];
+    let bytes = (pids.len() * std::mem::size_of::<i32>()) as i32;
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    pids.truncate(n as usize);
+    pids
+}
+
+/// Running applications as `(pid, localized name)`, built fresh on each call.
+///
+/// `NSWorkspace.runningApplications` is a cache that is refreshed through the
+/// main thread. The engine's main thread is parked by tokio and the detector
+/// reads from a worker, so the cache never learns of an app launched after the
+/// engine started: native Zoom opened for a call was never scanned, and the
+/// meeting-gated audio stayed off for the whole call (#1). Listing pids from
+/// the kernel and resolving each through LaunchServices sees it at once, for a
+/// few milliseconds per scan. Must be called inside an autorelease pool.
+#[cfg(target_os = "macos")]
+fn running_apps_now() -> Vec<(i32, String)> {
+    all_pids()
+        .into_iter()
+        .filter(|&pid| pid > 0)
+        .filter_map(|pid| {
+            let app = cidre::ns::RunningApp::with_pid(pid)?;
+            let name = app.localized_name()?.to_string();
+            Some((pid, name))
+        })
+        .collect()
+}
+
 /// When `currently_tracking_app` is provided, the function ensures that browser
 /// process is included in results even if no URL pattern is found in window titles.
 /// This handles the edge case where a user switches Chrome tabs during a Google Meet
@@ -2051,16 +2086,7 @@ pub fn find_running_meeting_apps(
     let mut results = Vec::new();
 
     cidre::objc::ar_pool(|| {
-        let workspace = cidre::ns::Workspace::shared();
-        let apps = workspace.running_apps();
-
-        for i in 0..apps.len() {
-            let app = &apps[i];
-            let pid = app.pid();
-            let name = match app.localized_name() {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
+        for (pid, name) in running_apps_now() {
             let name_lower = name.to_lowercase();
 
             // Check if this is the currently-tracked browser process
@@ -2532,17 +2558,11 @@ async fn db_find_browser_meetings(
             if url_match || title_match {
                 #[cfg(target_os = "macos")]
                 let pid = cidre::objc::ar_pool(|| -> i32 {
-                    let ws = cidre::ns::Workspace::shared();
-                    let apps = ws.running_apps();
-                    for i in 0..apps.len() {
-                        let a = &apps[i];
-                        if let Some(n) = a.localized_name() {
-                            if n.to_string().to_lowercase() == app_lower {
-                                return a.pid();
-                            }
-                        }
-                    }
-                    -1
+                    running_apps_now()
+                        .into_iter()
+                        .find(|(_, n)| n.to_lowercase() == app_lower)
+                        .map(|(pid, _)| pid)
+                        .unwrap_or(-1)
                 });
                 #[cfg(not(target_os = "macos"))]
                 let pid = -1i32;
@@ -3454,6 +3474,58 @@ async fn insert_new_meeting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── apps launched after the engine started (#1) ─────────────
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_pid_list_includes_a_process_started_after_the_first_scan() {
+        let before = all_pids();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let after = all_pids();
+        child.kill().unwrap();
+        let _ = child.wait();
+        assert!(!before.contains(&pid));
+        assert!(
+            after.contains(&pid),
+            "a process started after the first scan is missing"
+        );
+    }
+
+    /// Launches Calculator in the background and quits it, so it only runs on
+    /// request: `cargo test -p screenpipe-engine --lib apps_launched_later -- --ignored`.
+    /// Mirrors the engine: the main thread is parked and the scan runs on
+    /// another thread, which is where `NSWorkspace.runningApplications` stays
+    /// stale.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn apps_launched_later_are_found_from_a_worker_thread() {
+        let has_calculator =
+            || cidre::objc::ar_pool(|| running_apps_now().iter().any(|(_, n)| n == "Calculator"));
+        assert!(
+            !has_calculator(),
+            "quit Calculator before running this test"
+        );
+        let found = std::thread::spawn(move || {
+            std::process::Command::new("/usr/bin/open")
+                .args(["-g", "-j", "-a", "Calculator"])
+                .status()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            has_calculator()
+        })
+        .join()
+        .unwrap();
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .args(["-e", "quit app \"Calculator\""])
+            .status();
+        assert!(found, "an app launched after the first scan was not found");
+    }
 
     // ── audio-gated scan cadence tests ─────────────────────────────────
     // These pin the CPU optimisation: with apps open but no recent audio the

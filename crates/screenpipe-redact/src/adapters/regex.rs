@@ -208,13 +208,34 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             Some(national_id::sedol),
         ),
         // Credit / debit card — brand IIN + length + Luhn (the brand gate
-        // is what stops Luhn-passing hashes / timestamps).
+        // is what stops Luhn-passing hashes / timestamps). No `\b`: OCR
+        // glues a card number to its label and the brand mark
+        // ("Number*4242…4242VISA"), and a word boundary never falls
+        // between a digit and a letter.
         (
-            r"\b(?:\d[ -]?){13,19}\b",
+            r"(?:\d[ -]?){12,18}\d",
             SpanLabel::Id,
             Some("credit_card"),
             &[],
             Some(national_id::credit_card),
+        ),
+        // Card security code and expiry. The label is part of the match
+        // rather than a context keyword, because the keyword gate wants
+        // whole words and OCR glues the label to the previous field
+        // ("09/31CVC*737").
+        (
+            r"(?i)(?:cvc2?|cvv2?|security\s*code)[^0-9a-z]{0,3}\d{3,4}",
+            SpanLabel::Id,
+            Some("card_security_code"),
+            &[],
+            None,
+        ),
+        (
+            r"(?i)(?:exp(?:iry|iration)?|valid\s*thru)(?:\s*date)?[^0-9a-z]{0,3}(?:0?[1-9]|1[0-2])\s?/\s?(?:\d{4}|\d{2})",
+            SpanLabel::Id,
+            Some("card_expiry"),
+            &[],
+            None,
         ),
         // ---- checksummed government / national IDs ----
         // Brazil CPF — 11 digits, two mod-11 check digits.

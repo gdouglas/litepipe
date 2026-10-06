@@ -100,6 +100,8 @@ pub const KNOWN_SUBTYPES: &[&str] = &[
     // checksum-validated
     "us_ssn",
     "credit_card",
+    "card_security_code",
+    "card_expiry",
     "iban",
     "isin",
     "cusip",
@@ -293,6 +295,12 @@ pub const KNOWN_SUBTYPES: &[&str] = &[
     "us_ein",
 ];
 
+/// Sub-types removed under every policy, like [`SpanLabel::Secret`].
+/// The Settings toggle promises "keys, cards, passwords", so payment
+/// card details cannot depend on the user also opting into the generic
+/// `id` class, which the Settings UI does not offer.
+pub const ALWAYS_REDACTED_SUBTYPES: &[&str] = &["credit_card", "card_security_code", "card_expiry"];
+
 /// Parse user-configured label names (canonical snake_case [`SpanLabel`]
 /// wire names) into a de-duplicated allow-list, preserving the caller's
 /// order.
@@ -401,13 +409,16 @@ impl TextRedactionPolicy {
 
     /// Is a span with this label / sub-type eligible for redaction under
     /// the current policy? A span qualifies if its coarse label is
-    /// allowed, OR its specific sub-type was opted in.
+    /// allowed, OR its specific sub-type was opted in, OR the sub-type is
+    /// one of the [`ALWAYS_REDACTED_SUBTYPES`].
     pub fn allows(&self, label: SpanLabel, subtype: Option<&str>) -> bool {
         if self.allow.contains(&label) {
             return true;
         }
         match subtype {
-            Some(st) => self.allow_subtypes.contains(st),
+            Some(st) => {
+                ALWAYS_REDACTED_SUBTYPES.contains(&st) || self.allow_subtypes.contains(st)
+            }
             None => false,
         }
     }

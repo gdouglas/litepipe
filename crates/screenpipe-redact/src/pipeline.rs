@@ -398,4 +398,59 @@ mod tests {
             .iter()
             .all(|s| s.label == crate::SpanLabel::Secret));
     }
+
+    // ---- payment cards under the shipped default ----
+    //
+    // The Settings toggle reads "Redact secrets (keys, cards, passwords)"
+    // and the shipped `piiRedactionLabels` is `["secret"]`. These drive
+    // the pipeline exactly as the engine builds it from that setting.
+    // Card numbers are published test PANs, not real cards.
+
+    fn shipped_default() -> Pipeline {
+        Pipeline::regex_only_with_policy(TextRedactionPolicy::from_labels(&[
+            "secret".to_string()
+        ]))
+    }
+
+    #[tokio::test]
+    async fn card_number_is_removed_under_the_shipped_default() {
+        let out = shipped_default()
+            .redact("Card number 4111 1111 1111 1111 saved")
+            .await
+            .unwrap();
+        assert!(
+            !out.redacted.contains("4111 1111 1111 1111"),
+            "card survived: {}",
+            out.redacted
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_form_ocr_with_no_separators_is_scrubbed() {
+        // How a checkout form reads back from OCR: labels, values and the
+        // brand mark glued together with no whitespace.
+        let text = "Card Number*4242424242424242VISAName On Card*Expiry Date*09/31CVC*737Billing";
+        let out = shipped_default().redact(text).await.unwrap();
+        assert!(!out.redacted.contains("4242424242424242"), "card: {}", out.redacted);
+        assert!(!out.redacted.contains("09/31"), "expiry: {}", out.redacted);
+        assert!(!out.redacted.contains("737"), "cvc: {}", out.redacted);
+    }
+
+    #[tokio::test]
+    async fn security_code_and_expiry_labels_are_scrubbed() {
+        let out = shipped_default()
+            .redact("Expiration date: 11 / 2030  Security code: 4821  CVV 019")
+            .await
+            .unwrap();
+        assert!(!out.redacted.contains("2030"), "expiry: {}", out.redacted);
+        assert!(!out.redacted.contains("4821"), "csc: {}", out.redacted);
+        assert!(!out.redacted.contains("019"), "cvv: {}", out.redacted);
+    }
+
+    #[tokio::test]
+    async fn dates_and_numbers_outside_payment_fields_are_kept() {
+        let text = "Meeting 09/31 room 737, order 4821, build 1234567890123";
+        let out = shipped_default().redact(text).await.unwrap();
+        assert_eq!(out.redacted, text);
+    }
 }

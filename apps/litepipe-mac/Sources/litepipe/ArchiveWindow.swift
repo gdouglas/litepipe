@@ -97,22 +97,19 @@ final class ArchiveModels {
     /// stop now and a start later.
     private var resumeWork: DispatchWorkItem?
 
-    /// When capture last changed through this window. Pausing kills the engine
-    /// process, so a stray toggle is not a cosmetic bug: it stops recording. The
-    /// log shows these arriving in pairs seconds apart, which no person clicking
-    /// a menu produces, so anything that fast is refused and named in the log
-    /// until the source is found.
-    private var lastToggle = Date.distantPast
+    /// Refuses a repeated pause or resume that arrives too fast to be a
+    /// person, and always lets a reversal through. See `CaptureToggleGuard`.
+    private var toggleGuard = CaptureToggleGuard()
 
-    private func accept(_ what: String) -> Bool {
-        let gap = Date().timeIntervalSince(lastToggle)
-        guard gap > 1.0 else {
-            litepipeLog("capture \(what) refused: \(String(format: "%.2f", gap))s after the last one")
+    private func accept(_ direction: CaptureToggleGuard.Direction) -> Bool {
+        switch toggleGuard.decide(direction) {
+        case .accepted:
+            litepipeLog("capture \(direction.rawValue) from the window")
+            return true
+        case .refused(let gap):
+            litepipeLog("capture \(direction.rawValue) refused: repeated \(String(format: "%.2f", gap))s after the last one")
             return false
         }
-        lastToggle = Date()
-        litepipeLog("capture \(what) from the window")
-        return true
     }
 
     init(engine: EngineController) {
@@ -121,7 +118,7 @@ final class ArchiveModels {
         onboarding.bootstrap()
 
         nav.onPause = { [weak self] seconds in
-            guard let self, self.accept("pause") else { return }
+            guard let self, self.accept(.pause) else { return }
             self.resumeWork?.cancel()
             self.engine.stop(markPaused: true, source: "archive window")
             self.engine.cue(paused: true)
@@ -131,7 +128,7 @@ final class ArchiveModels {
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
         }
         nav.onResume = { [weak self] in
-            guard let self, self.accept("resume") else { return }
+            guard let self, self.accept(.resume) else { return }
             self.resumeWork?.cancel()
             self.resumeWork = nil
             self.engine.start()

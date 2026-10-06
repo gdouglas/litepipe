@@ -317,11 +317,13 @@ mod tests {
 
         db.close_orphaned_meetings().await.unwrap();
 
-        assert_eq!(
-            read_end(&db, id).await,
-            fmt(last),
-            "ends at its last segment"
-        );
+        // SQLite's strftime goes through a floating-point julian day, so
+        // the stamp can differ from the segment by a millisecond.
+        let end = chrono::DateTime::parse_from_rfc3339(&read_end(&db, id).await).unwrap();
+        let drift = (end.with_timezone(&chrono::Utc) - last)
+            .num_milliseconds()
+            .abs();
+        assert!(drift <= 1, "ends at its last segment, off by {drift} ms");
         let candidate = db.find_recent_meeting_for_app("Zoom", 120).await.unwrap();
         assert!(
             candidate.is_none(),

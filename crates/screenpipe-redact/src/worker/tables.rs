@@ -53,6 +53,14 @@ pub enum TargetTable {
     /// Clipboard payloads captured via UI events
     /// (`ui_events.text_content` filtered to `event_type='clipboard'`).
     UiEventsClipboard,
+    /// The frame's combined searchable text (`frames.full_text`), which
+    /// feeds `frames_fts`. Built from accessibility and OCR text at
+    /// insert, so redacting those columns leaves this copy intact.
+    FrameFullText,
+    /// Per-element screen text (`elements.text`), which feeds
+    /// `elements_fts`. Only ids above `redaction_floor` are taken; older
+    /// rows are left to an explicit purge (see the 20261005 migration).
+    Elements,
 }
 
 pub const ALL_TARGET_TABLES: &[TargetTable] = &[
@@ -61,6 +69,8 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
     TargetTable::Accessibility,
     TargetTable::UiEventsKeyboard,
     TargetTable::UiEventsClipboard,
+    TargetTable::FrameFullText,
+    TargetTable::Elements,
 ];
 
 /// One row to redact.
@@ -80,6 +90,8 @@ impl TargetTable {
             // consolidation; see the variant docs above.
             Self::Accessibility => "frames",
             Self::UiEventsKeyboard | Self::UiEventsClipboard => "ui_events",
+            Self::FrameFullText => "frames",
+            Self::Elements => "elements",
         }
     }
 
@@ -90,6 +102,8 @@ impl TargetTable {
             Self::AudioTranscription => "transcription",
             Self::Accessibility => "accessibility_text",
             Self::UiEventsKeyboard | Self::UiEventsClipboard => "text_content",
+            Self::FrameFullText => "full_text",
+            Self::Elements => "text",
         }
     }
 
@@ -100,6 +114,7 @@ impl TargetTable {
     pub fn redacted_at_col(&self) -> &'static str {
         match self {
             Self::Accessibility => "accessibility_redacted_at",
+            Self::FrameFullText => "full_text_redacted_at",
             _ => "redacted_at",
         }
     }
@@ -120,6 +135,9 @@ impl TargetTable {
         match self {
             Self::UiEventsKeyboard => Some("event_type IN ('text','key')"),
             Self::UiEventsClipboard => Some("event_type = 'clipboard'"),
+            Self::Elements => Some(
+                "id > COALESCE((SELECT min_id FROM redaction_floor WHERE table_name = 'elements'), 0)",
+            ),
             _ => None,
         }
     }
@@ -132,6 +150,8 @@ impl TargetTable {
             Self::Accessibility => "frames:accessibility_text",
             Self::UiEventsKeyboard => "ui_events:keyboard",
             Self::UiEventsClipboard => "ui_events:clipboard",
+            Self::FrameFullText => "frames:full_text",
+            Self::Elements => "elements",
         }
     }
 }
@@ -234,7 +254,18 @@ mod tests {
             CREATE TABLE frames (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 accessibility_text TEXT,
-                accessibility_redacted_at INTEGER
+                accessibility_redacted_at INTEGER,
+                full_text TEXT,
+                full_text_redacted_at INTEGER
+            );
+            CREATE TABLE elements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT,
+                redacted_at INTEGER
+            );
+            CREATE TABLE redaction_floor (
+                table_name TEXT PRIMARY KEY,
+                min_id INTEGER NOT NULL
             );
             CREATE TABLE ui_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -382,5 +413,87 @@ mod tests {
         let when: Option<i64> = row.get(1);
         assert_eq!(raw, "[PERSON]", "source must be overwritten");
         assert!(when.is_some(), "accessibility_redacted_at must be stamped");
+    }
+
+    #[test]
+    fn every_captured_text_column_is_a_target() {
+        // Each column that stores captured screen, audio or input text,
+        // and feeds a search index, has to be rewritten by the worker.
+        // A column left out keeps the raw value however good the
+        // detectors get: card numbers survived in exactly these two.
+        let covered: Vec<(&str, &str)> = ALL_TARGET_TABLES
+            .iter()
+            .map(|t| (t.table(), t.source_col()))
+            .collect();
+        for want in [
+            ("ocr_text", "text"),
+            ("audio_transcriptions", "transcription"),
+            ("frames", "accessibility_text"),
+            ("frames", "full_text"),
+            ("elements", "text"),
+            ("ui_events", "text_content"),
+        ] {
+            assert!(covered.contains(&want), "not redacted: {want:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_text_is_read_and_overwritten_with_its_own_marker() {
+        let pool = setup().await;
+        sqlx::query(
+            "INSERT INTO frames (accessibility_text, accessibility_redacted_at, full_text) \
+             VALUES ('[ID]', 1, 'Card 4242424242424242')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = fetch_unredacted(&pool, TargetTable::FrameFullText, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "accessibility marker must not hide full_text");
+        write_redacted(&pool, TargetTable::FrameFullText, rows[0].id, "Card [ID]")
+            .await
+            .unwrap();
+        let (text, when): (String, Option<i64>) =
+            sqlx::query_as("SELECT full_text, full_text_redacted_at FROM frames WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(text, "Card [ID]");
+        assert!(when.is_some());
+    }
+
+    #[tokio::test]
+    async fn elements_below_the_floor_are_left_for_the_purge() {
+        let pool = setup().await;
+        for t in ["old one", "old two", "new one"] {
+            sqlx::query("INSERT INTO elements (text) VALUES (?)")
+                .bind(t)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO redaction_floor VALUES ('elements', 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = fetch_unredacted(&pool, TargetTable::Elements, 10)
+            .await
+            .unwrap();
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["new one"]);
+    }
+
+    #[tokio::test]
+    async fn elements_without_a_floor_are_all_covered() {
+        let pool = setup().await;
+        sqlx::query("INSERT INTO elements (text) VALUES ('a'), ('b')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = fetch_unredacted(&pool, TargetTable::Elements, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }

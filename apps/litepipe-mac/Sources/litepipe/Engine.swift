@@ -401,11 +401,13 @@ final class EngineController: ObservableObject {
         if micGateInMeeting == inMeeting { return }
         micGateBusy = true
         let action = inMeeting ? "audio/start" : "audio/stop"
-        engineAPI(action, method: "POST", body: [:]) { [weak self] json in
+        engineCall(action, method: "POST", body: [:]) { [weak self] reply in
             guard let self else { return }
-            if json != nil {
+            if reply.succeeded {
                 litepipeLog("audio gate: \(inMeeting ? "started (meeting)" : "stopped, devices released (idle)")")
                 self.micGateInMeeting = inMeeting
+            } else {
+                litepipeLog("audio gate: \(action) failed, status \(reply.status.map(String.init) ?? "none")")
             }
             self.micGateBusy = false
         }
@@ -413,7 +415,16 @@ final class EngineController: ObservableObject {
 
     func engineAPI(_ path: String, method: String, body: [String: Any]?,
                    done: @escaping (Any?) -> Void) {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/\(path)") else { done(nil); return }
+        engineCall(path, method: method, body: body) { done($0.json) }
+    }
+
+    /// Like `engineAPI`, but hands back the status, for calls whose success
+    /// cannot be read from the body.
+    func engineCall(_ path: String, method: String, body: [String: Any]?,
+                    done: @escaping (EngineReply) -> Void) {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/\(path)") else {
+            done(EngineReply(status: nil, data: nil)); return
+        }
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.timeoutInterval = 2
@@ -422,9 +433,10 @@ final class EngineController: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         }
-        URLSession.shared.dataTask(with: req) { data, _, _ in
+        URLSession.shared.dataTask(with: req) { data, response, _ in
+            let status = (response as? HTTPURLResponse)?.statusCode
             DispatchQueue.main.async {
-                done(data.flatMap { try? JSONSerialization.jsonObject(with: $0) })
+                done(EngineReply(status: status, data: data))
             }
         }.resume()
     }

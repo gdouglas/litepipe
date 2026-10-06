@@ -24,7 +24,8 @@ let package = Package(
             ]
         ),
         // Value types with no AppKit event plumbing, such as the guard on
-        // pausing and resuming capture, can be checked without a running app.
+        // pausing and resuming capture and how an engine reply is judged, can
+        // be checked without a running app.
         .testTarget(
             name: "litepipeTests",
             dependencies: ["litepipe"],

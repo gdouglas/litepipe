@@ -257,4 +257,106 @@ mod tests {
             Some(MEETING_END_REASON_AUTO_END)
         );
     }
+
+    // ---- orphan close must not make an old meeting look just-ended ----
+    //
+    // Issue #3: the orphan cleanup stamped `meeting_end = now`, so a row left
+    // open days earlier fell inside the 120 s merge window, and the next call
+    // on the same app was folded into it (a 71-hour, then a 4-day meeting).
+
+    async fn insert_open_meeting(db: &DatabaseManager, app: &str, start: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO meetings (meeting_start, meeting_app, detection_source) \
+             VALUES (?1, ?2, 'ui_scan')",
+        )
+        .bind(start)
+        .bind(app)
+        .execute(&db.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn add_segment(db: &DatabaseManager, meeting_id: i64, at: chrono::DateTime<chrono::Utc>) {
+        db.insert_meeting_transcript_segment(
+            meeting_id,
+            "selected-engine",
+            None,
+            &format!("item-{}", at.timestamp_millis()),
+            "System Audio",
+            "output",
+            None,
+            "synthetic segment",
+            at,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn read_end(db: &DatabaseManager, id: i64) -> String {
+        let (end,): (String,) = sqlx::query_as("SELECT meeting_end FROM meetings WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        end
+    }
+
+    fn fmt(t: chrono::DateTime<chrono::Utc>) -> String {
+        t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    }
+
+    #[tokio::test]
+    async fn orphan_abandoned_days_ago_is_not_reopened_by_the_next_call() {
+        let db = setup_test_db().await;
+        let start = chrono::Utc::now() - chrono::Duration::days(4);
+        let last = start + chrono::Duration::minutes(20);
+        let id = insert_open_meeting(&db, "Zoom", &fmt(start)).await;
+        add_segment(&db, id, start + chrono::Duration::minutes(1)).await;
+        add_segment(&db, id, last).await;
+
+        db.close_orphaned_meetings().await.unwrap();
+
+        // SQLite's strftime goes through a floating-point julian day, so
+        // the stamp can differ from the segment by a millisecond.
+        let end = chrono::DateTime::parse_from_rfc3339(&read_end(&db, id).await).unwrap();
+        let drift = (end.with_timezone(&chrono::Utc) - last)
+            .num_milliseconds()
+            .abs();
+        assert!(drift <= 1, "ends at its last segment, off by {drift} ms");
+        let candidate = db.find_recent_meeting_for_app("Zoom", 120).await.unwrap();
+        assert!(
+            candidate.is_none(),
+            "a call starting now must get its own row"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_from_a_crash_mid_call_stays_merge_eligible() {
+        let db = setup_test_db().await;
+        let start = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let id = insert_open_meeting(&db, "Zoom", &fmt(start)).await;
+        add_segment(&db, id, chrono::Utc::now() - chrono::Duration::seconds(20)).await;
+
+        db.close_orphaned_meetings().await.unwrap();
+
+        let candidate = db.find_recent_meeting_for_app("Zoom", 120).await.unwrap();
+        assert_eq!(candidate.map(|m| m.id), Some(id));
+    }
+
+    #[tokio::test]
+    async fn orphan_with_no_segments_ends_at_its_start() {
+        let db = setup_test_db().await;
+        let start = fmt(chrono::Utc::now() - chrono::Duration::days(3));
+        let id = insert_open_meeting(&db, "Zoom", &start).await;
+
+        db.close_orphaned_meetings().await.unwrap();
+
+        assert_eq!(read_end(&db, id).await, start);
+        assert!(db
+            .find_recent_meeting_for_app("Zoom", 120)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

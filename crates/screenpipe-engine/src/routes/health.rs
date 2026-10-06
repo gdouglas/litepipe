@@ -26,6 +26,9 @@ type AudioReconciliationBacklogCache = (i64, Option<(u64, Option<DateTime<Utc>>)
 static AUDIO_RECONCILIATION_BACKLOG_CACHE: std::sync::LazyLock<
     RwLock<AudioReconciliationBacklogCache>,
 > = std::sync::LazyLock::new(|| RwLock::new((0, None)));
+/// (computed at, expired pending chunk count) — see `get_expired_transcription_count`.
+static EXPIRED_TRANSCRIPTION_CACHE: std::sync::LazyLock<RwLock<(i64, Option<u64>)>> =
+    std::sync::LazyLock::new(|| RwLock::new((0, None)));
 
 /// Minimum interval between full health recomputations (in seconds).
 const HEALTH_CACHE_TTL_SECS: u64 = 1;
@@ -62,6 +65,19 @@ fn audio_backlog_is_stalled(
 /// Old message always said "pool exhaustion likely" which was wrong when the
 /// real cause was elsewhere (e.g. metrics gap on reconciliation path) and the
 /// pools were fully idle. Only call out pool saturation when idle counts are 0.
+/// Whether the audio pipeline reads as degraded. `pending_backlog` is
+/// already cleared while batch mode is deliberately deferring during a
+/// session. Expired chunks count even then: unlike the live backlog,
+/// nothing will ever pick them up on its own.
+fn audio_pipeline_degraded(
+    channel_full: bool,
+    db_write_stalled: bool,
+    pending_backlog: bool,
+    expired_chunks: bool,
+) -> bool {
+    channel_full || db_write_stalled || pending_backlog || expired_chunks
+}
+
 fn suspected_stall_cause(read_idle: u32, write_idle: u32) -> &'static str {
     if write_idle == 0 && read_idle == 0 {
         "both pools saturated"
@@ -202,6 +218,11 @@ pub struct AudioPipelineHealthInfo {
     pub pending_transcription_segments: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_transcription_at: Option<chrono::DateTime<Utc>>,
+    /// Pending audio chunks older than the reconciliation lookback. Nothing
+    /// transcribes these and they are not in `pending_transcription_segments`;
+    /// the audio is still on disk and can be retranscribed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expired_transcription_segments: Option<u64>,
     // Meeting detection fields (smart mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meeting_detected: Option<bool>,
@@ -337,6 +358,41 @@ async fn get_audio_reconciliation_backlog(
     result
 }
 
+/// Count of pending chunks that fell out of the reconciliation lookback
+/// without being transcribed. Cached like the backlog query; `None` when
+/// there are none or the query fails.
+async fn get_expired_transcription_count(state: &Arc<AppState>, now: DateTime<Utc>) -> Option<u64> {
+    {
+        let cache = EXPIRED_TRANSCRIPTION_CACHE.read().await;
+        if now.timestamp().saturating_sub(cache.0) < AUDIO_RECONCILIATION_BACKLOG_CACHE_TTL_SECS {
+            return cache.1;
+        }
+    }
+    let before = now - chrono::Duration::hours(AUDIO_RECONCILIATION_LOOKBACK_HOURS);
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        state.db.count_expired_pending_chunks(before),
+    )
+    .await
+    {
+        Ok(Ok(count)) if count > 0 => Some(count as u64),
+        Ok(Ok(_)) => None,
+        Ok(Err(err)) => {
+            warn!(
+                "health_check: failed to count expired audio chunks: {}",
+                err
+            );
+            None
+        }
+        Err(_) => {
+            warn!("health_check: expired audio chunk count timed out");
+            None
+        }
+    };
+    *EXPIRED_TRANSCRIPTION_CACHE.write().await = (now.timestamp(), result);
+    result
+}
+
 async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -417,6 +473,11 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         .filter(|count| *count > 0);
     let oldest_pending_transcription_at =
         audio_reconciliation_backlog.and_then(|(_, oldest)| oldest);
+    let expired_transcription_segments = if !state.audio_disabled {
+        get_expired_transcription_count(state, now).await
+    } else {
+        None
+    };
 
     // Query meeting/audio-session state once, early, so both the stall checks
     // below and the audio_pipeline payload further down can reuse it. The
@@ -691,7 +752,12 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 audio_snap.chunks_channel_full
             );
         }
-        channel_full || audio_db_write_stalled || transcription_backlog
+        audio_pipeline_degraded(
+            channel_full,
+            audio_db_write_stalled,
+            transcription_backlog,
+            expired_transcription_segments.is_some(),
+        )
     } else {
         false
     };
@@ -771,6 +837,13 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 detail_parts.push(format!(
                     "{} audio segment(s) waiting for background transcription",
                     count
+                ));
+            }
+            if let Some(count) = expired_transcription_segments {
+                detail_parts.push(format!(
+                    "{} audio segment(s) older than {} days were never transcribed",
+                    count,
+                    AUDIO_RECONCILIATION_LOOKBACK_HOURS / 24
                 ));
             }
         }
@@ -932,6 +1005,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 batch_paused_reason: None, // populated by idle detector if available
                 pending_transcription_segments,
                 oldest_pending_transcription_at,
+                expired_transcription_segments,
                 meeting_detected,
                 meeting_app,
             })
@@ -1127,6 +1201,34 @@ mod tests {
         let cloned = resp.clone();
         assert_eq!(cloned.status, "healthy");
         assert_eq!(cloned.status_code, 200);
+    }
+
+    #[test]
+    fn expired_audio_degrades_health_on_its_own() {
+        // Mid-meeting the live backlog is deliberately not counted, but audio
+        // that aged out of the lookback still has to show.
+        assert!(audio_pipeline_degraded(false, false, false, true));
+        assert!(!audio_pipeline_degraded(false, false, false, false));
+    }
+
+    #[test]
+    fn expired_count_is_its_own_field_and_absent_when_zero() {
+        // check.py and the vault's meeting-notes check read the existing
+        // field names, so the new signal is added beside them, not renamed.
+        let mut audio: AudioPipelineHealthInfo = serde_json::from_value(serde_json::json!({
+            "uptime_secs": 0.0, "chunks_sent": 0, "chunks_channel_full": 0,
+            "stream_timeouts": 0, "vad_passed": 0, "vad_rejected": 0,
+            "vad_passthrough_rate": 0.0, "avg_speech_ratio": 0.0,
+            "transcriptions_completed": 0, "transcriptions_empty": 0,
+            "transcription_errors": 0, "db_inserted": 0, "total_words": 0,
+            "words_per_minute": 0.0
+        }))
+        .unwrap();
+        let json = serde_json::to_value(&audio).unwrap();
+        assert!(json.get("expired_transcription_segments").is_none());
+        audio.expired_transcription_segments = Some(558);
+        let json = serde_json::to_value(&audio).unwrap();
+        assert_eq!(json["expired_transcription_segments"], 558);
     }
 
     #[test]

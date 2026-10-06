@@ -22,6 +22,13 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("sqlite3")
             ]
+        ),
+        // Value types with no AppKit event plumbing, such as how an engine
+        // reply is judged, can be checked without a running app.
+        .testTarget(
+            name: "litepipeTests",
+            dependencies: ["litepipe"],
+            path: "Tests/litepipeTests"
         )
     ]
 )

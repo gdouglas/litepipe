@@ -407,9 +407,7 @@ mod tests {
     // Card numbers are published test PANs, not real cards.
 
     fn shipped_default() -> Pipeline {
-        Pipeline::regex_only_with_policy(TextRedactionPolicy::from_labels(&[
-            "secret".to_string()
-        ]))
+        Pipeline::regex_only_with_policy(TextRedactionPolicy::from_labels(&["secret".to_string()]))
     }
 
     #[tokio::test]
@@ -431,7 +429,11 @@ mod tests {
         // brand mark glued together with no whitespace.
         let text = "Card Number*4242424242424242VISAName On Card*Expiry Date*09/31CVC*737Billing";
         let out = shipped_default().redact(text).await.unwrap();
-        assert!(!out.redacted.contains("4242424242424242"), "card: {}", out.redacted);
+        assert!(
+            !out.redacted.contains("4242424242424242"),
+            "card: {}",
+            out.redacted
+        );
         assert!(!out.redacted.contains("09/31"), "expiry: {}", out.redacted);
         assert!(!out.redacted.contains("737"), "cvc: {}", out.redacted);
     }

@@ -416,9 +416,7 @@ impl TextRedactionPolicy {
             return true;
         }
         match subtype {
-            Some(st) => {
-                ALWAYS_REDACTED_SUBTYPES.contains(&st) || self.allow_subtypes.contains(st)
-            }
+            Some(st) => ALWAYS_REDACTED_SUBTYPES.contains(&st) || self.allow_subtypes.contains(st),
             None => false,
         }
     }

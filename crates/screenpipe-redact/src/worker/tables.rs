@@ -450,7 +450,11 @@ mod tests {
         let rows = fetch_unredacted(&pool, TargetTable::FrameFullText, 10)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1, "accessibility marker must not hide full_text");
+        assert_eq!(
+            rows.len(),
+            1,
+            "accessibility marker must not hide full_text"
+        );
         write_redacted(&pool, TargetTable::FrameFullText, rows[0].id, "Card [ID]")
             .await
             .unwrap();

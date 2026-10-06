@@ -9010,6 +9010,13 @@ LIMIT ? OFFSET ?
         Ok(())
     }
 
+    /// Close meetings left open by a previous engine session. The end is
+    /// the meeting's last transcript segment, or its start when it has
+    /// none, rather than now: stamping now made a meeting abandoned days
+    /// earlier look as if it had just ended, so the 120 s merge window in
+    /// `find_recent_meeting_for_app` folded the next call into it (#3). A
+    /// crash mid-call still has a segment from seconds ago, so that case
+    /// stays merge-eligible.
     pub async fn close_orphaned_meetings(&self) -> Result<u64, SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
         let now = chrono::Utc::now()
@@ -9017,7 +9024,12 @@ LIMIT ? OFFSET ?
             .to_string();
         let rows = sqlx::query(
             "UPDATE meetings
-             SET meeting_end = ?1, end_reason = ?2
+             SET meeting_end = COALESCE(
+                   (SELECT strftime('%Y-%m-%dT%H:%M:%fZ', MAX(s.captured_at))
+                      FROM meeting_transcript_segments s
+                     WHERE s.meeting_id = meetings.id),
+                   meeting_start),
+                 end_reason = ?2
              WHERE meeting_end IS NULL
                AND (
                  detection_source != 'manual'

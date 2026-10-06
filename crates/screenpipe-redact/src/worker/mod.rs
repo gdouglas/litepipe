@@ -74,6 +74,9 @@ pub struct WorkerStatus {
 pub struct Worker {
     pool: SqlitePool,
     redactor: Arc<dyn Redactor>,
+    /// Cheaper redactor for tables that ask for it; see
+    /// [`TargetTable::uses_light_redactor`]. Falls back to `redactor`.
+    light: Option<Arc<dyn Redactor>>,
     cfg: WorkerConfig,
     status: Arc<Mutex<WorkerStatus>>,
     paused: Arc<std::sync::atomic::AtomicBool>,
@@ -84,10 +87,18 @@ impl Worker {
         Self {
             pool,
             redactor,
+            light: None,
             cfg,
             status: Arc::new(Mutex::new(WorkerStatus::default())),
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Use `light` for tables whose rows are too many for the full
+    /// redactor (see [`TargetTable::uses_light_redactor`]).
+    pub fn with_light_redactor(mut self, light: Arc<dyn Redactor>) -> Self {
+        self.light = Some(light);
+        self
     }
 
     pub fn pause(&self) {
@@ -269,7 +280,11 @@ impl Worker {
         debug!(table = ?table, count = rows.len(), "redacting batch");
 
         let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
-        let outputs = self.redactor.redact_batch(&texts).await?;
+        let redactor = match &self.light {
+            Some(light) if table.uses_light_redactor() => light,
+            _ => &self.redactor,
+        };
+        let outputs = redactor.redact_batch(&texts).await?;
 
         if outputs.len() != rows.len() {
             anyhow::bail!(

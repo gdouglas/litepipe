@@ -61,6 +61,11 @@ pub enum TargetTable {
     /// `elements_fts`. Only ids above `redaction_floor` are taken; older
     /// rows are left to an explicit purge (see the 20261005 migration).
     Elements,
+    /// Meeting transcripts (`meeting_transcript_segments.transcript`), the
+    /// transcript that meeting notes and the MCP transcript tool read. Only
+    /// ids above `redaction_floor` are taken; older rows are left to an
+    /// explicit purge (see the 20261006120000 migration).
+    MeetingTranscript,
 }
 
 pub const ALL_TARGET_TABLES: &[TargetTable] = &[
@@ -71,6 +76,7 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
     TargetTable::UiEventsClipboard,
     TargetTable::FrameFullText,
     TargetTable::Elements,
+    TargetTable::MeetingTranscript,
 ];
 
 /// One row to redact.
@@ -92,6 +98,7 @@ impl TargetTable {
             Self::UiEventsKeyboard | Self::UiEventsClipboard => "ui_events",
             Self::FrameFullText => "frames",
             Self::Elements => "elements",
+            Self::MeetingTranscript => "meeting_transcript_segments",
         }
     }
 
@@ -104,6 +111,7 @@ impl TargetTable {
             Self::UiEventsKeyboard | Self::UiEventsClipboard => "text_content",
             Self::FrameFullText => "full_text",
             Self::Elements => "text",
+            Self::MeetingTranscript => "transcript",
         }
     }
 
@@ -141,6 +149,9 @@ impl TargetTable {
             Self::FrameFullText => Some(
                 "id > COALESCE((SELECT min_id FROM redaction_floor WHERE table_name = 'frames_full_text'), 0)",
             ),
+            Self::MeetingTranscript => Some(
+                "id > COALESCE((SELECT min_id FROM redaction_floor WHERE table_name = 'meeting_transcript_segments'), 0)",
+            ),
             _ => None,
         }
     }
@@ -151,6 +162,7 @@ impl TargetTable {
         match self {
             Self::Elements => Some("elements"),
             Self::FrameFullText => Some("frames_full_text"),
+            Self::MeetingTranscript => Some("meeting_transcript_segments"),
             _ => None,
         }
     }
@@ -160,6 +172,15 @@ impl TargetTable {
     /// frame's full_text can be filled in by OCR after the row exists, so
     /// the frames floor stays put and a partial index keeps the fetch cheap.
     pub fn advances_floor(&self) -> bool {
+        matches!(self, Self::Elements)
+    }
+
+    /// Whether rows go through the worker's light redactor, when it has one.
+    /// Elements get dozens of rows per frame; running the model over each
+    /// grew the backlog faster than it drained and held the engine at
+    /// several cores, so they take the deterministic regex pass instead,
+    /// which still removes keys, cards, security codes and expiry dates.
+    pub fn uses_light_redactor(&self) -> bool {
         matches!(self, Self::Elements)
     }
 
@@ -173,6 +194,7 @@ impl TargetTable {
             Self::UiEventsClipboard => "ui_events:clipboard",
             Self::FrameFullText => "frames:full_text",
             Self::Elements => "elements",
+            Self::MeetingTranscript => "meeting_transcript_segments",
         }
     }
 }
@@ -486,6 +508,7 @@ mod tests {
             ("frames", "accessibility_text"),
             ("frames", "full_text"),
             ("elements", "text"),
+            ("meeting_transcript_segments", "transcript"),
             ("ui_events", "text_content"),
         ] {
             assert!(covered.contains(&want), "not redacted: {want:?}");

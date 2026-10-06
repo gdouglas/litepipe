@@ -1975,7 +1975,12 @@ async fn main() -> anyhow::Result<()> {
                 tables: ALL_TARGET_TABLES.to_vec(),
                 ..Default::default()
             };
-            let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg).spawn();
+            // elements get dozens of rows per frame, too many for the model;
+            // they take the regex pass under the same policy.
+            let light = Arc::new(Pipeline::regex_only_with_policy(policy.clone())) as Arc<dyn Redactor>;
+            let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg)
+                .with_light_redactor(light)
+                .spawn();
             // The worker runs for the lifetime of the engine. We don't
             // join its handle — when the process exits the runtime
             // tears down the task. If we ever want graceful shutdown

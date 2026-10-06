@@ -453,4 +453,62 @@ mod tests {
         let out = shipped_default().redact(text).await.unwrap();
         assert_eq!(out.redacted, text);
     }
+
+    /// Stands in for the local ONNX model: echoes its input and tags the
+    /// first digit run as a generic `Id` with no subtype, which the
+    /// shipped policy drops.
+    struct EchoIdAi;
+
+    #[async_trait]
+    impl Redactor for EchoIdAi {
+        fn name(&self) -> &str {
+            "echo-id"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        async fn redact_batch(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<RedactionOutput>, RedactError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let start = t.find(|c: char| c.is_ascii_digit()).unwrap_or(0);
+                    let end = t[start..]
+                        .find(|c: char| !c.is_ascii_digit() && c != ' ')
+                        .map(|e| start + e)
+                        .unwrap_or(t.len());
+                    RedactionOutput {
+                        input: t.clone(),
+                        redacted: t.clone(),
+                        spans: vec![RedactedSpan {
+                            start,
+                            end,
+                            label: crate::SpanLabel::Id,
+                            subtype: None,
+                            text: t[start..end].to_string(),
+                        }],
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ai_step_cannot_bring_a_card_back() {
+        // The engine runs regex then the local model, not regex alone.
+        let p = Pipeline::regex_then_ai(
+            Arc::new(EchoIdAi),
+            PipelineConfig {
+                policy: TextRedactionPolicy::from_labels(&["secret".to_string()]),
+                ..Default::default()
+            },
+        );
+        let out = p
+            .redact("Pay with card 4111 1111 1111 1111 before the deadline")
+            .await
+            .unwrap();
+        assert!(!out.redacted.contains("4111"), "card: {}", out.redacted);
+    }
 }

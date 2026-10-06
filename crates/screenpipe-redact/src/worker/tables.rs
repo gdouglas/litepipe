@@ -138,17 +138,29 @@ impl TargetTable {
             Self::Elements => Some(
                 "id > COALESCE((SELECT min_id FROM redaction_floor WHERE table_name = 'elements'), 0)",
             ),
+            Self::FrameFullText => Some(
+                "id > COALESCE((SELECT min_id FROM redaction_floor WHERE table_name = 'frames_full_text'), 0)",
+            ),
             _ => None,
         }
     }
 
-    /// Name in `redaction_floor` for tables scanned upward from a moving
-    /// floor instead of by an index on the redacted-at column.
+    /// Name in `redaction_floor` for tables whose rows from before the
+    /// upgrade are left to an explicit purge rather than a backfill.
     pub fn floor_name(&self) -> Option<&'static str> {
         match self {
             Self::Elements => Some("elements"),
+            Self::FrameFullText => Some("frames_full_text"),
             _ => None,
         }
+    }
+
+    /// Whether the floor follows the worker up. Only for elements, whose
+    /// text is written at insert and which has no index on its marker. A
+    /// frame's full_text can be filled in by OCR after the row exists, so
+    /// the frames floor stays put and a partial index keeps the fetch cheap.
+    pub fn advances_floor(&self) -> bool {
+        matches!(self, Self::Elements)
     }
 
     /// Stable-ish identifier for logs / status.
@@ -168,7 +180,8 @@ impl TargetTable {
 /// Fetch up to `limit` rows that need redaction. Newest-first — users
 /// search recent activity, so the most-likely-to-be-queried rows are
 /// reconciled first.
-/// Floor-scoped tables (see [`TargetTable::floor_name`]) are oldest-first.
+/// Tables whose floor moves (see [`TargetTable::advances_floor`]) are
+/// oldest-first.
 pub async fn fetch_unredacted(
     pool: &SqlitePool,
     table: TargetTable,
@@ -191,8 +204,8 @@ pub async fn fetch_unredacted(
         tbl = table.table(),
         redacted_at = table.redacted_at_col(),
         extra = extra,
-        // A floor-scoped table is walked upward so the floor can follow it.
-        order = if table.floor_name().is_some() {
+        // A table whose floor moves is walked upward so the floor can follow.
+        order = if table.advances_floor() {
             "ASC"
         } else {
             "DESC"
@@ -250,7 +263,7 @@ pub async fn advance_floor(
     table: TargetTable,
     written: &[UnredactedRow],
 ) -> Result<(), sqlx::Error> {
-    let Some(name) = table.floor_name() else {
+    let Some(name) = table.floor_name().filter(|_| table.advances_floor()) else {
         return Ok(());
     };
     let Some(top) = written.iter().map(|r| r.id).max() else {
@@ -587,5 +600,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.iter().map(|r| r.id).collect::<Vec<_>>(), [3]);
+    }
+
+    #[tokio::test]
+    async fn full_text_below_its_floor_is_left_for_the_purge() {
+        // Frames from before the upgrade are not backfilled: running the
+        // model over every stored frame took about a second a frame.
+        let pool = setup().await;
+        for t in ["old", "new"] {
+            sqlx::query("INSERT INTO frames (full_text) VALUES (?)")
+                .bind(t)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO redaction_floor VALUES ('frames_full_text', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = fetch_unredacted(&pool, TargetTable::FrameFullText, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            ["new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_filled_in_after_a_batch_is_still_redacted() {
+        // OCR can fill a frame's full_text after the row exists, so the
+        // frames floor must not move past a frame that was empty when the
+        // worker went by.
+        let pool = setup().await;
+        sqlx::query("INSERT INTO frames (full_text) VALUES (''), ('has text')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO redaction_floor VALUES ('frames_full_text', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let batch = fetch_unredacted(&pool, TargetTable::FrameFullText, 10)
+            .await
+            .unwrap();
+        for r in &batch {
+            write_redacted(&pool, TargetTable::FrameFullText, r.id, "x")
+                .await
+                .unwrap();
+        }
+        advance_floor(&pool, TargetTable::FrameFullText, &batch)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE frames SET full_text = 'late ocr' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let next = fetch_unredacted(&pool, TargetTable::FrameFullText, 10)
+            .await
+            .unwrap();
+        assert_eq!(next.iter().map(|r| r.id).collect::<Vec<_>>(), [1]);
     }
 }

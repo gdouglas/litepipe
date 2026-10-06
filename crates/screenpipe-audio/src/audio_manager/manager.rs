@@ -313,8 +313,53 @@ impl AudioManager {
             }
         }
 
-        // Spawn reconciliation sweep for orphaned audio chunks (batch mode only)
-        if self.options.read().await.transcription_mode == TranscriptionMode::Batch {
+        self.ensure_reconciliation_sweep().await;
+
+        start_device_monitor(self_arc.clone(), self.device_manager.clone()).await?;
+
+        // Seed known speakers from DB on startup
+        seed_speakers_from_db(&self.db, &self.segmentation_manager).await;
+
+        // Subscribe to meeting events for calendar-assisted speaker diarization
+        {
+            let seg_mgr = self.segmentation_manager.clone();
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                run_meeting_speaker_constraint_loop(seg_mgr, db).await;
+            });
+        }
+
+        info!("audio manager started");
+
+        Ok(())
+    }
+
+    pub async fn restart(&self) -> Result<()> {
+        self.stop_internal().await?;
+        self.start_internal().await?;
+        info!("audio manager restarted");
+        Ok(())
+    }
+
+    /// Spawn the background sweep that transcribes audio chunks left
+    /// pending (batch mode only), unless one is already running.
+    async fn ensure_reconciliation_sweep(&self) {
+        if self.options.read().await.transcription_mode != TranscriptionMode::Batch {
+            return;
+        }
+        // One sweep per manager. `start()` runs on every mic-gate open, and
+        // the sweep outlives `stop()`, so spawning unconditionally would
+        // leave one more loop behind per meeting.
+        if self
+            .reconciliation_handle
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+        {
+            return;
+        }
+        {
             let db = self.db.clone();
             let engine_ref = self.engine.clone();
             let on_insert_bg = self.on_transcription_insert.clone();
@@ -365,6 +410,9 @@ impl AudioManager {
                             )
                             .await;
                             if count > 0 {
+                                for _ in 0..count {
+                                    metrics_bg.record_segment_batch_processed();
+                                }
                                 info!("reconciliation: transcribed {} orphaned chunks", count);
                             }
                         }
@@ -387,31 +435,6 @@ impl AudioManager {
             });
             *self.reconciliation_handle.write().await = Some(handle);
         }
-
-        start_device_monitor(self_arc.clone(), self.device_manager.clone()).await?;
-
-        // Seed known speakers from DB on startup
-        seed_speakers_from_db(&self.db, &self.segmentation_manager).await;
-
-        // Subscribe to meeting events for calendar-assisted speaker diarization
-        {
-            let seg_mgr = self.segmentation_manager.clone();
-            let db = self.db.clone();
-            tokio::spawn(async move {
-                run_meeting_speaker_constraint_loop(seg_mgr, db).await;
-            });
-        }
-
-        info!("audio manager started");
-
-        Ok(())
-    }
-
-    pub async fn restart(&self) -> Result<()> {
-        self.stop_internal().await?;
-        self.start_internal().await?;
-        info!("audio manager restarted");
-        Ok(())
     }
 
     async fn stop_internal(&self) -> Result<()> {
@@ -1568,6 +1591,15 @@ async fn run_meeting_speaker_constraint_loop(
 
 impl Drop for AudioManager {
     fn drop(&mut self) {
+        // Every field is shared between clones, and `start()` hands a clone
+        // to the device monitor that `stop()` then drops. Only the last
+        // owner tears the shared tasks down; otherwise each mic-gate close
+        // killed the background transcription sweep (#5). The handle Arc is
+        // never cloned outside this function, so its count is the number
+        // of live clones.
+        if Arc::strong_count(&self.reconciliation_handle) > 1 {
+            return;
+        }
         let rec = self.recording_handles.clone();
         let recording = self.recording_receiver_handle.clone();
         let transcript = self.transcription_receiver_handle.clone();
@@ -1707,5 +1739,79 @@ mod tests {
             !is_drm_blocked,
             "after DRM clears, device should not be blocked"
         );
+    }
+
+    // ── clone lifetime ─────────────────────────────────────────
+
+    /// `start()` hands a clone to the device monitor, and `stop()` drops it
+    /// when it aborts the monitor. Every field is shared, so a clone's Drop
+    /// must not tear down tasks the remaining owners still rely on: doing so
+    /// killed the background transcription sweep on every mic-gate close
+    /// (#5), leaving deferred audio untranscribed.
+    #[tokio::test]
+    async fn dropping_a_clone_leaves_the_sweep_running() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let options = AudioManagerOptions {
+            is_disabled: true,
+            vad_engine: VadEngineEnum::WebRtc,
+            ..Default::default()
+        };
+        let manager = AudioManager::new(options, db).await.unwrap();
+        let sweep = tokio::spawn(std::future::pending::<()>());
+        let probe = sweep.abort_handle();
+        *manager.reconciliation_handle.write().await = Some(sweep);
+
+        drop(manager.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !probe.is_finished(),
+            "a clone's drop aborted the shared sweep"
+        );
+
+        drop(manager);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            probe.is_finished(),
+            "the last owner must still stop the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_start_keeps_the_running_sweep() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let options = AudioManagerOptions {
+            is_disabled: true,
+            vad_engine: VadEngineEnum::WebRtc,
+            transcription_mode: TranscriptionMode::Batch,
+            ..Default::default()
+        };
+        let manager = AudioManager::new(options, db).await.unwrap();
+
+        manager.ensure_reconciliation_sweep().await;
+        let first = manager
+            .reconciliation_handle
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .id();
+        manager.ensure_reconciliation_sweep().await;
+        let second = manager
+            .reconciliation_handle
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .id();
+
+        assert_eq!(first, second, "a second start spawned another sweep loop");
     }
 }

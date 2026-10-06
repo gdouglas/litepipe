@@ -191,6 +191,36 @@ mod tests {
         assert!(!candidates.iter().any(|c| c.file_path == "fresh.mp4"));
     }
 
+    /// Pending chunks older than the reconciliation lookback are never
+    /// picked up again and drop out of the backlog count (#5: 558 chunks
+    /// from one week aged out unseen). They must still be countable.
+    #[tokio::test]
+    async fn test_pending_chunks_past_the_lookback_are_counted_as_expired() {
+        let db = setup_test_db().await;
+
+        let lookback = Utc::now() - Duration::days(7);
+        db.insert_audio_chunk("expired-a.mp4", Some(lookback - Duration::days(2)))
+            .await
+            .unwrap();
+        db.insert_audio_chunk("expired-b.mp4", Some(lookback - Duration::hours(1)))
+            .await
+            .unwrap();
+        db.insert_audio_chunk("in-window.mp4", Some(lookback + Duration::hours(1)))
+            .await
+            .unwrap();
+        let done = db
+            .insert_audio_chunk("expired-done.mp4", Some(lookback - Duration::days(3)))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE audio_chunks SET transcription_status = 'transcribed' WHERE id = ?1")
+            .bind(done)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(db.count_expired_pending_chunks(lookback).await.unwrap(), 2);
+    }
+
     #[tokio::test]
     async fn test_live_meeting_transcript_does_not_block_background_reconciliation() {
         let db = setup_test_db().await;

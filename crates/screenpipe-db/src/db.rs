@@ -1180,6 +1180,29 @@ impl DatabaseManager {
         Ok(summary)
     }
 
+    /// Pending audio chunks older than `before`, the reconciliation
+    /// lookback. Nothing transcribes these any more and they are not in
+    /// [`Self::get_reconciliation_backlog_summary`], so without this count
+    /// they leave the backlog silently. The audio is still on disk.
+    pub async fn count_expired_pending_chunks(
+        &self,
+        before: DateTime<Utc>,
+    ) -> Result<i64, sqlx::Error> {
+        let (count,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*)
+             FROM audio_chunks
+             WHERE transcription_status = 'pending'
+               AND transcription_attempts < ?2
+               AND timestamp < ?1
+               AND file_path NOT LIKE 'cloud://%'",
+        )
+        .bind(before)
+        .bind(MAX_TRANSCRIPTION_ATTEMPTS)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     /// Compact processing-state snapshot of recent audio chunks. Used by the
     /// health diagnostic to detect a genuine stall (real "pending older than
     /// X" chunks) vs the previous heuristic (idle pool + stale metric, which

@@ -282,6 +282,7 @@ impl Worker {
         for (row, out) in rows.iter().zip(outputs.iter()) {
             tables::write_redacted(&self.pool, table, row.id, &out.redacted).await?;
         }
+        tables::advance_floor(&self.pool, table, &rows).await?;
 
         let n = rows.len() as u32;
         let mut s = self.status.lock().await;

@@ -142,6 +142,15 @@ impl TargetTable {
         }
     }
 
+    /// Name in `redaction_floor` for tables scanned upward from a moving
+    /// floor instead of by an index on the redacted-at column.
+    pub fn floor_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Elements => Some("elements"),
+            _ => None,
+        }
+    }
+
     /// Stable-ish identifier for logs / status.
     pub fn label(&self) -> &'static str {
         match self {
@@ -159,6 +168,7 @@ impl TargetTable {
 /// Fetch up to `limit` rows that need redaction. Newest-first — users
 /// search recent activity, so the most-likely-to-be-queried rows are
 /// reconciled first.
+/// Floor-scoped tables (see [`TargetTable::floor_name`]) are oldest-first.
 pub async fn fetch_unredacted(
     pool: &SqlitePool,
     table: TargetTable,
@@ -174,13 +184,19 @@ pub async fn fetch_unredacted(
          WHERE {src} IS NOT NULL AND {src} != '' \
            AND {redacted_at} IS NULL\
            {extra} \
-         ORDER BY {pk} DESC \
+         ORDER BY {pk} {order} \
          LIMIT ?",
         pk = table.pk_col(),
         src = table.source_col(),
         tbl = table.table(),
         redacted_at = table.redacted_at_col(),
         extra = extra,
+        // A floor-scoped table is walked upward so the floor can follow it.
+        order = if table.floor_name().is_some() {
+            "ASC"
+        } else {
+            "DESC"
+        },
     );
 
     let rows = sqlx::query(&q).bind(limit as i64).fetch_all(pool).await?;
@@ -222,6 +238,32 @@ pub async fn write_redacted(
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// After a batch is written, move a floor-scoped table's floor up to the
+/// highest id in it. Rows at or below that id either were in the batch or
+/// had nothing to redact, so the next fetch starts after it. No-op for
+/// tables without a floor.
+pub async fn advance_floor(
+    pool: &SqlitePool,
+    table: TargetTable,
+    written: &[UnredactedRow],
+) -> Result<(), sqlx::Error> {
+    let Some(name) = table.floor_name() else {
+        return Ok(());
+    };
+    let Some(top) = written.iter().map(|r| r.id).max() else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO redaction_floor (table_name, min_id) VALUES (?1, ?2) \
+         ON CONFLICT(table_name) DO UPDATE SET min_id = MAX(min_id, excluded.min_id)",
+    )
+    .bind(name)
+    .bind(top)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -499,5 +541,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_elements_floor_moves_past_each_written_batch() {
+        // Once the worker has caught up, a fetch that only filters on
+        // redacted_at walks every row above a fixed floor on every poll,
+        // and elements grows by hundreds of thousands of rows a day. The
+        // floor moves past each batch instead, oldest first, so a poll
+        // only touches rows it has not seen.
+        let pool = setup().await;
+        for t in ["a", "b", "c"] {
+            sqlx::query("INSERT INTO elements (text) VALUES (?)")
+                .bind(t)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO redaction_floor VALUES ('elements', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let first = fetch_unredacted(&pool, TargetTable::Elements, 2)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = first.iter().map(|r| r.id).collect();
+        assert_eq!(ids, [1, 2], "oldest first above the floor");
+        for r in &first {
+            write_redacted(&pool, TargetTable::Elements, r.id, "x")
+                .await
+                .unwrap();
+        }
+        advance_floor(&pool, TargetTable::Elements, &first)
+            .await
+            .unwrap();
+
+        let (floor,): (i64,) =
+            sqlx::query_as("SELECT min_id FROM redaction_floor WHERE table_name = 'elements'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(floor, 2);
+        let next = fetch_unredacted(&pool, TargetTable::Elements, 2)
+            .await
+            .unwrap();
+        assert_eq!(next.iter().map(|r| r.id).collect::<Vec<_>>(), [3]);
     }
 }

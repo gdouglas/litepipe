@@ -51,6 +51,9 @@ final class EngineController: ObservableObject {
     private let maxRestartAttempts = 5
     private var micGateBusy = false
     private var micGateInMeeting: Bool?
+    /// When the gate last closed, to tell a stop the engine ignored from the
+    /// final chunk of one it honoured. See `MicGateDrift`.
+    private var micGateClosedAt: Date?
 
     // Local API key for the engine's control endpoints (write ops need auth).
     // Generated once, persisted, and handed to the engine via env at spawn.
@@ -378,6 +381,13 @@ final class EngineController: ObservableObject {
                 } else if s.contains("error") || s.contains("unhealthy") {
                     if self.micGateInMeeting != false { self.status = .error("engine unhealthy") }
                 }
+                let lastAudio = MicGateDrift.parse(obj["last_audio_timestamp"] as? String)
+                if MicGateDrift.engineStillRecording(gateInMeeting: self.micGateInMeeting,
+                                                     closedAt: self.micGateClosedAt,
+                                                     lastAudio: lastAudio) {
+                    litepipeLog("audio gate: engine still recording after stop, stopping again")
+                    self.micGateInMeeting = nil
+                }
                 // This engine build only reports meeting state on /meetings/status.
                 self.engineAPI("meetings/status", method: "GET", body: nil) { json in
                     let active = ((json as? [String: Any])?["active"] as? Bool) ?? false
@@ -406,6 +416,7 @@ final class EngineController: ObservableObject {
             if reply.succeeded {
                 litepipeLog("audio gate: \(inMeeting ? "started (meeting)" : "stopped, devices released (idle)")")
                 self.micGateInMeeting = inMeeting
+                self.micGateClosedAt = inMeeting ? nil : Date()
             } else {
                 litepipeLog("audio gate: \(action) failed, status \(reply.status.map(String.init) ?? "none")")
             }

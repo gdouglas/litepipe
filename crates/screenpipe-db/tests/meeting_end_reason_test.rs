@@ -317,9 +317,16 @@ mod tests {
 
         db.close_orphaned_meetings().await.unwrap();
 
-        assert_eq!(read_end(&db, id).await, fmt(last), "ends at its last segment");
+        assert_eq!(
+            read_end(&db, id).await,
+            fmt(last),
+            "ends at its last segment"
+        );
         let candidate = db.find_recent_meeting_for_app("Zoom", 120).await.unwrap();
-        assert!(candidate.is_none(), "a call starting now must get its own row");
+        assert!(
+            candidate.is_none(),
+            "a call starting now must get its own row"
+        );
     }
 
     #[tokio::test]
@@ -344,6 +351,10 @@ mod tests {
         db.close_orphaned_meetings().await.unwrap();
 
         assert_eq!(read_end(&db, id).await, start);
-        assert!(db.find_recent_meeting_for_app("Zoom", 120).await.unwrap().is_none());
+        assert!(db
+            .find_recent_meeting_for_app("Zoom", 120)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

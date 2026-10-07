@@ -1975,8 +1975,9 @@ async fn main() -> anyhow::Result<()> {
                 tables: ALL_TARGET_TABLES.to_vec(),
                 ..Default::default()
             };
-            // elements get dozens of rows per frame, too many for the model;
-            // they take the regex pass under the same policy.
+            // elements get dozens of rows per frame, and full_text repeats
+            // text the model already redacts in its own columns; both take
+            // the regex pass under the same policy.
             let light = Arc::new(Pipeline::regex_only_with_policy(policy.clone())) as Arc<dyn Redactor>;
             let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg)
                 .with_light_redactor(light)

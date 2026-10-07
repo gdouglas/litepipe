@@ -23,9 +23,9 @@ let package = Package(
                 .linkedLibrary("sqlite3")
             ]
         ),
-        // Value types with no AppKit event plumbing, such as the guard on
-        // pausing and resuming capture and how an engine reply is judged, can
-        // be checked without a running app.
+        // Value types with no AppKit event plumbing, such as the shortcut
+        // binding, the guard on pausing and resuming capture and how an engine
+        // reply is judged, can be checked without a running app.
         .testTarget(
             name: "litepipeTests",
             dependencies: ["litepipe"],

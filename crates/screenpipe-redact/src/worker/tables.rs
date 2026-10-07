@@ -176,12 +176,14 @@ impl TargetTable {
     }
 
     /// Whether rows go through the worker's light redactor, when it has one.
-    /// Elements get dozens of rows per frame; running the model over each
+    /// Elements get dozens of rows per frame, and a frame's full_text is its
+    /// accessibility text and OCR text joined, both of which the model
+    /// already redacts in their own columns. Running the model over either
     /// grew the backlog faster than it drained and held the engine at
     /// several cores, so they take the deterministic regex pass instead,
     /// which still removes keys, cards, security codes and expiry dates.
     pub fn uses_light_redactor(&self) -> bool {
-        matches!(self, Self::Elements)
+        matches!(self, Self::Elements | Self::FrameFullText)
     }
 
     /// Stable-ish identifier for logs / status.

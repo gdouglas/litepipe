@@ -772,9 +772,15 @@ mod runtime {
     fn build_session(model_path: &std::path::Path) -> Result<Session, RedactError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || -> Result<Session, ort::Error> {
+                // The worker calls this session in a loop with short naps
+                // between batches. With spinning on, the pool's threads
+                // busy-wait through every gap and between the model's own
+                // parallel sections, which profiled at about five times the
+                // CPU of the model's real work.
                 let builder = Session::builder()?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus_physical())?;
+                    .with_intra_threads(num_cpus_physical())?
+                    .with_intra_op_spinning(false)?;
                 #[cfg(feature = "onnx-coreml")]
                 let builder = builder.with_execution_providers([
                     ort::execution_providers::CoreMLExecutionProvider::default()
@@ -816,11 +822,13 @@ mod runtime {
         }
     }
 
-    /// Best-effort physical core count for ORT intra-op threads.
-    /// Pinned to a small max to avoid oversubscribing on big servers.
+    /// Best-effort core count for ORT intra-op threads.
+    /// Pinned to a small max: the redactor runs in the background next to
+    /// capture, OCR and transcription, and a batch of short texts gains
+    /// little past four threads.
     fn num_cpus_physical() -> usize {
         std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
+            .map(|n| n.get().clamp(1, 4))
             .unwrap_or(4)
     }
 

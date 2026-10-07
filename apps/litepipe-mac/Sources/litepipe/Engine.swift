@@ -361,7 +361,7 @@ final class EngineController: ObservableObject {
                 } else if s.contains("error") || s.contains("unhealthy") {
                     if self.micGateInMeeting != false { self.status = .error("engine unhealthy") }
                 }
-                let lastAudio = MicGateDrift.parse(obj["last_audio_timestamp"] as? String)
+                let lastAudio = MicGateDrift.lastCapture(fromHealth: obj)
                 if MicGateDrift.engineStillRecording(gateInMeeting: self.micGateInMeeting,
                                                      closedAt: self.micGateClosedAt,
                                                      lastAudio: lastAudio) {

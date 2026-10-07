@@ -134,6 +134,9 @@ pub struct AudioManager {
     /// The device monitor must never auto-start devices in this set.
     /// Cleared on global start/stop but preserved across reconnects.
     user_disabled_devices: Arc<RwLock<HashSet<String>>>,
+    /// Set by `stop()` and cleared by `start()`. The engine's own start at
+    /// launch waits ten seconds, and a stop that came first must hold.
+    stop_requested: Arc<AtomicBool>,
 }
 
 /// Result of checking / restarting the two central handler tasks.
@@ -215,6 +218,7 @@ impl AudioManager {
             reconciliation_handle: Arc::new(RwLock::new(None)),
             drm_stopped_devices: Arc::new(RwLock::new(Vec::new())),
             user_disabled_devices: Arc::new(RwLock::new(HashSet::new())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
         };
 
         Ok(manager)
@@ -276,6 +280,32 @@ impl AudioManager {
     }
 
     pub async fn start(&self) -> Result<()> {
+        self.stop_requested.store(false, Ordering::SeqCst);
+        self.start_if_enabled().await
+    }
+
+    /// The engine's own start, some seconds after launch. A stop that
+    /// arrived before it found nothing running, so it is honoured here
+    /// instead of being undone.
+    pub async fn start_at_launch(&self) -> Result<()> {
+        if self.stop_requested() {
+            info!("audio start at launch skipped: audio was stopped before it began");
+            return Ok(());
+        }
+        self.start_if_enabled().await?;
+        if self.stop_requested() {
+            info!("audio was stopped while it was starting at launch; stopping it");
+            self.stop().await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the last request was a stop.
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    async fn start_if_enabled(&self) -> Result<()> {
         if self.options.read().await.is_disabled {
             info!("audio manager start skipped because audio capture is disabled");
             return Ok(());
@@ -488,6 +518,7 @@ impl AudioManager {
     }
 
     pub async fn stop(&self) -> Result<()> {
+        self.stop_requested.store(true, Ordering::SeqCst);
         if self.status().await == AudioManagerStatus::Stopped {
             return Ok(());
         }
@@ -1813,5 +1844,44 @@ mod tests {
             .id();
 
         assert_eq!(first, second, "a second start spawned another sweep loop");
+    }
+
+    // ── launch start versus an earlier stop ────────────────────
+
+    /// The engine starts audio by itself ten seconds after launch. A stop
+    /// that arrived first, such as the app's mic gate closing outside a
+    /// meeting, found nothing running and was dropped, so the launch start
+    /// turned the mic on anyway (#1). The stop has to outlast that wait, and
+    /// an explicit start, such as a meeting beginning, has to clear it.
+    #[tokio::test]
+    async fn a_stop_before_the_launch_start_holds_until_an_explicit_start() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let options = AudioManagerOptions {
+            is_disabled: true,
+            vad_engine: crate::vad::VadEngineEnum::WebRtc,
+            ..Default::default()
+        };
+        let manager = AudioManager::new(options, db).await.unwrap();
+        assert!(!manager.stop_requested(), "a fresh engine starts audio at launch");
+
+        manager.stop().await.unwrap();
+        assert!(
+            manager.stop_requested(),
+            "a stop before audio started was forgotten"
+        );
+        assert!(
+            manager.clone().stop_requested(),
+            "every clone shares the request"
+        );
+
+        manager.start().await.unwrap();
+        assert!(
+            !manager.stop_requested(),
+            "an explicit start must clear the earlier stop"
+        );
     }
 }

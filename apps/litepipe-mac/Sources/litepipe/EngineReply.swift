@@ -21,15 +21,22 @@ struct EngineReply {
 ///
 /// A stop can arrive before the engine has started audio at launch: the engine
 /// answers 200 to a stop that did nothing, starts audio seconds later, and the
-/// gate, trusting its record, would never send stop again. The engine's own
-/// `last_audio_timestamp` is the check. Audio stamped after the gate closed,
-/// past a grace for the final chunk of a real stop, means stop again.
+/// gate, trusting its record, would never send stop again. The engine's
+/// `last_audio_capture_timestamp`, when a device last delivered audio, is the
+/// check. Audio captured after the gate closed, past a grace for the final
+/// chunk of a real stop, means stop again. `last_audio_timestamp` is the last
+/// audio database write, which background transcription also moves, so it
+/// is not read.
 enum MicGateDrift {
     static let grace: TimeInterval = 5
 
     static func engineStillRecording(gateInMeeting: Bool?, closedAt: Date?, lastAudio: Date?) -> Bool {
         guard gateInMeeting == false, let closedAt, let lastAudio else { return false }
         return lastAudio > closedAt + grace
+    }
+
+    static func lastCapture(fromHealth health: [String: Any]) -> Date? {
+        parse(health["last_audio_capture_timestamp"] as? String)
     }
 
     static func parse(_ raw: String?) -> Date? {

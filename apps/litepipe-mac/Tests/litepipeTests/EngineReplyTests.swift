@@ -55,6 +55,21 @@ final class MicGateDriftTests: XCTestCase {
             gateInMeeting: nil, closedAt: nil, lastAudio: closed + 60))
     }
 
+    // Background transcription writes audio rows long after a stop, so the
+    // time of the last audio write kept the gate re-sending stop every few
+    // seconds. Only the time a device last delivered audio counts.
+    func testTheGateReadsCaptureTimeNotTheLastDatabaseWrite() {
+        let health: [String: Any] = [
+            "last_audio_timestamp": "2026-10-07T11:19:28-07:00",
+            "last_audio_capture_timestamp": "2026-10-07T11:01:43-07:00",
+        ]
+        XCTAssertEqual(MicGateDrift.lastCapture(fromHealth: health),
+                       MicGateDrift.parse("2026-10-07T11:01:43-07:00"))
+        XCTAssertNil(MicGateDrift.lastCapture(fromHealth: [
+            "last_audio_timestamp": "2026-10-07T11:19:28-07:00",
+        ]))
+    }
+
     func testTheEnginesTimestampFormatIsRead() {
         XCTAssertNotNil(MicGateDrift.parse("2026-10-06T00:18:17-07:00"))
         XCTAssertNotNil(MicGateDrift.parse("2026-10-06T07:18:17.123Z"))

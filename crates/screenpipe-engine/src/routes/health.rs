@@ -95,6 +95,10 @@ pub struct HealthCheckResponse {
     pub status_code: u16,
     pub last_frame_timestamp: Option<chrono::DateTime<Utc>>,
     pub last_audio_timestamp: Option<chrono::DateTime<Utc>>,
+    /// When a device last delivered real audio. `last_audio_timestamp` is the
+    /// last audio database write, which background transcription also moves,
+    /// so it can't tell whether the engine is still recording.
+    pub last_audio_capture_timestamp: Option<chrono::DateTime<Utc>>,
     pub frame_status: String,
     pub audio_status: String,
     pub message: String,
@@ -274,6 +278,7 @@ fn degraded_response() -> HealthCheckResponse {
         status_code: 503,
         last_frame_timestamp: None,
         last_audio_timestamp: None,
+        last_audio_capture_timestamp: None,
         frame_status: "unknown".to_string(),
         audio_status: "unknown".to_string(),
         message: "health check timed out before producing a snapshot".to_string(),
@@ -844,6 +849,8 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         } else {
             None
         },
+        last_audio_capture_timestamp: screenpipe_audio::core::last_real_capture_time()
+            .and_then(|ts| Utc.timestamp_opt(ts as i64, 0).single()),
         frame_status: frame_status.to_string(),
         audio_status,
         message,
@@ -1067,6 +1074,7 @@ mod tests {
             status_code: 200,
             last_frame_timestamp: None,
             last_audio_timestamp: None,
+            last_audio_capture_timestamp: None,
             frame_status: "ok".to_string(),
             audio_status: "ok".to_string(),
             message: "test".to_string(),

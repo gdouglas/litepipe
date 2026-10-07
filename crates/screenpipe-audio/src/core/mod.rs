@@ -47,6 +47,17 @@ pub fn update_device_capture_time(device_name: &str) {
         .store(now, Ordering::Relaxed);
 }
 
+/// The last time any device delivered real audio, or `None` if none has
+/// since the process started. Unlike `get_device_capture_time`, this never
+/// falls back to the process start time, so it moves only when audio is
+/// actually being captured.
+pub fn last_real_capture_time() -> Option<u64> {
+    DEVICE_AUDIO_CAPTURES
+        .iter()
+        .map(|entry| entry.value().load(Ordering::Relaxed))
+        .max()
+}
+
 /// Gets the last capture time for a specific device
 pub fn get_device_capture_time(device_name: &str) -> u64 {
     DEVICE_AUDIO_CAPTURES
@@ -105,4 +116,24 @@ pub async fn record_and_transcribe_with_live_tap(
         live_audio_tap,
     )
     .await
+}
+
+#[cfg(test)]
+mod capture_time_tests {
+    use super::*;
+
+    /// The app's mic gate asks whether audio is still arriving after it
+    /// closed. The time of the last database write answered that wrongly,
+    /// because background transcription writes too. Only a device that
+    /// delivered real audio may move this time.
+    #[test]
+    fn real_audio_moves_the_last_capture_time() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        update_device_capture_time("capture-time test device");
+        let last = last_real_capture_time().expect("a device delivered audio");
+        assert!(last >= before);
+    }
 }

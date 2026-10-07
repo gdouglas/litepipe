@@ -294,10 +294,20 @@ impl Worker {
             );
         }
 
+        // One transaction per batch rather than a commit per row. A row the
+        // redactor left unchanged isn't rewritten: an element is skipped,
+        // since the floor moves past it, and anything else gets only its
+        // marker, so text columns and their index triggers stay untouched.
+        let mut tx = self.pool.begin().await?;
         for (row, out) in rows.iter().zip(outputs.iter()) {
-            tables::write_redacted(&self.pool, table, row.id, &out.redacted).await?;
+            if out.redacted != row.text {
+                tables::write_redacted(&mut *tx, table, row.id, &out.redacted).await?;
+            } else if !table.advances_floor() {
+                tables::mark_redacted(&mut *tx, table, row.id).await?;
+            }
         }
-        tables::advance_floor(&self.pool, table, &rows).await?;
+        tables::advance_floor(&mut *tx, table, &rows).await?;
+        tx.commit().await?;
 
         let n = rows.len() as u32;
         let mut s = self.status.lock().await;

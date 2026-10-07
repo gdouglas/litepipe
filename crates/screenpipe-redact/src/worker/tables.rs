@@ -186,6 +186,14 @@ impl TargetTable {
         matches!(self, Self::Elements | Self::FrameFullText)
     }
 
+    /// Splits tables into those for the full redactor and those for the
+    /// light one. The engine runs each group in its own worker, so the
+    /// model's slow batches don't hold back the regex tables, which take
+    /// thousands of rows a minute.
+    pub fn partition_by_redactor(tables: &[TargetTable]) -> (Vec<TargetTable>, Vec<TargetTable>) {
+        tables.iter().copied().partition(|t| !t.uses_light_redactor())
+    }
+
     /// Stable-ish identifier for logs / status.
     pub fn label(&self) -> &'static str {
         match self {
@@ -254,12 +262,15 @@ pub async fn fetch_unredacted(
 ///
 /// Destructive by design: the raw text is gone after the UPDATE returns.
 /// That's the contract of the user-facing "AI PII removal" toggle.
-pub async fn write_redacted(
-    pool: &SqlitePool,
+pub async fn write_redacted<'e, E>(
+    pool: E,
     table: TargetTable,
     id: i64,
     redacted: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let q = format!(
         "UPDATE {tbl} SET \
             {src} = ?, \
@@ -278,15 +289,34 @@ pub async fn write_redacted(
     Ok(())
 }
 
+/// Stamp `redacted_at` without rewriting the text, for a row the redactor
+/// left unchanged. Leaves the source column, and any trigger on it, alone.
+pub async fn mark_redacted<'e, E>(pool: E, table: TargetTable, id: i64) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let q = format!(
+        "UPDATE {tbl} SET {redacted_at_col} = strftime('%s', 'now') WHERE {pk} = ?",
+        tbl = table.table(),
+        redacted_at_col = table.redacted_at_col(),
+        pk = table.pk_col(),
+    );
+    sqlx::query(&q).bind(id).execute(pool).await?;
+    Ok(())
+}
+
 /// After a batch is written, move a floor-scoped table's floor up to the
 /// highest id in it. Rows at or below that id either were in the batch or
 /// had nothing to redact, so the next fetch starts after it. No-op for
 /// tables without a floor.
-pub async fn advance_floor(
-    pool: &SqlitePool,
+pub async fn advance_floor<'e, E>(
+    pool: E,
     table: TargetTable,
     written: &[UnredactedRow],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let Some(name) = table.floor_name().filter(|_| table.advances_floor()) else {
         return Ok(());
     };

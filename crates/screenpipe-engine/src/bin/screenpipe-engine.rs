@@ -1857,7 +1857,7 @@ async fn main() -> anyhow::Result<()> {
                 tinfoil::{TinfoilConfig, TinfoilRedactor},
             },
             pipeline::{Pipeline, PipelineConfig},
-            worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
+            worker::{TargetTable, Worker, WorkerConfig, ALL_TARGET_TABLES},
             Redactor, TextRedactionPolicy,
         };
         use std::sync::Arc;
@@ -1971,17 +1971,25 @@ async fn main() -> anyhow::Result<()> {
             };
             let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
 
+            // elements get hundreds of rows per frame, and full_text repeats
+            // text the model already redacts in its own columns; both take
+            // the regex pass under the same policy. They run in a worker of
+            // their own with larger batches, so a pass of model batches,
+            // which can take a minute, doesn't hold them back.
+            let (full_tables, light_tables) =
+                TargetTable::partition_by_redactor(ALL_TARGET_TABLES);
             let worker_cfg = WorkerConfig {
-                tables: ALL_TARGET_TABLES.to_vec(),
+                tables: full_tables,
                 ..Default::default()
             };
-            // elements get dozens of rows per frame, and full_text repeats
-            // text the model already redacts in its own columns; both take
-            // the regex pass under the same policy.
+            let light_cfg = WorkerConfig {
+                tables: light_tables,
+                batch_size: 256,
+                ..Default::default()
+            };
             let light = Arc::new(Pipeline::regex_only_with_policy(policy.clone())) as Arc<dyn Redactor>;
-            let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg)
-                .with_light_redactor(light)
-                .spawn();
+            let _light_handle = Worker::new(pool.clone(), light, light_cfg).spawn();
+            let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg).spawn();
             // The worker runs for the lifetime of the engine. We don't
             // join its handle — when the process exits the runtime
             // tears down the task. If we ever want graceful shutdown

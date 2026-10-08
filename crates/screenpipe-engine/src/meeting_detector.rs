@@ -1945,6 +1945,56 @@ pub fn advance_state(
     }
 }
 
+/// Meeting ends the database refused, kept until they are written.
+///
+/// An end that failed used to be logged and dropped. The row stayed open, so
+/// the meeting stayed active, and the app's mic gate, which follows it, kept
+/// recording after the call (on 2026-10-08 the pool timed out under write
+/// contention and audio ran for over an hour). Each scan retries what is
+/// here, with the time the call actually ended.
+#[derive(Debug, Default)]
+struct PendingEnds(Vec<(i64, String)>);
+
+impl PendingEnds {
+    fn push(&mut self, meeting_id: i64, ended_at: String) {
+        if !self.0.iter().any(|(id, _)| *id == meeting_id) {
+            self.0.push((meeting_id, ended_at));
+        }
+    }
+
+    /// A meeting that was reopened is no longer ending.
+    fn forget(&mut self, meeting_id: i64) {
+        self.0.retain(|(id, _)| *id != meeting_id);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Write each pending end and keep the ones refused again. Returns the
+    /// meetings ended now.
+    async fn retry<F, Fut, E>(&mut self, mut write: F) -> Vec<i64>
+    where
+        F: FnMut(i64, String) -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+        E: std::fmt::Display,
+    {
+        let mut ended = Vec::new();
+        let mut refused = Vec::new();
+        for (id, at) in std::mem::take(&mut self.0) {
+            match write(id, at.clone()).await {
+                Ok(()) => ended.push(id),
+                Err(e) => {
+                    warn!("meeting v2: meeting {} still could not be ended: {}", id, e);
+                    refused.push((id, at));
+                }
+            }
+        }
+        self.0 = refused;
+        ended
+    }
+}
+
 /// Actions to perform after a state transition.
 #[derive(Debug)]
 pub enum StateAction {
@@ -2586,6 +2636,7 @@ pub async fn run_meeting_detection_loop(
     let base_interval = scan_interval.unwrap_or(ACTIVE_SCAN_INTERVAL);
     let mut current_interval = base_interval;
     let mut idle_scan_count: u64 = 0;
+    let mut pending_ends = PendingEnds::default();
 
     // Check if any profile uses browser URL or title patterns (to gate DB query)
     let has_browser_profiles = profiles.iter().any(|p| {
@@ -2684,6 +2735,30 @@ pub async fn run_meeting_detection_loop(
                 }
                 sync_meeting_flag(false, &in_meeting_flag, &detector);
                 return;
+            }
+        }
+
+        // Write any meeting end the database refused on an earlier scan.
+        if !pending_ends.is_empty() {
+            let ended = pending_ends
+                .retry(|id, at| {
+                    let db = db.clone();
+                    async move { db.end_meeting_with_typed_text(id, &at, true, None).await }
+                })
+                .await;
+            for meeting_id in ended {
+                info!("meeting v2: meeting ended on retry (id={})", meeting_id);
+                if let Err(e) = screenpipe_events::send_event(
+                    "meeting_ended",
+                    serde_json::json!({ "meeting_id": meeting_id }),
+                ) {
+                    warn!("meeting v2: failed to emit meeting_ended event: {}", e);
+                }
+                if let Ok(status) =
+                    resolve_meeting_status_from(db.as_ref(), manual_meeting.as_ref()).await
+                {
+                    emit_meeting_status_changed(&status);
+                }
             }
         }
 
@@ -2912,7 +2987,11 @@ pub async fn run_meeting_detection_loop(
                         }
                     }
                     Err(e) => {
-                        error!("meeting v2: failed to end meeting {}: {}", meeting_id, e);
+                        error!(
+                            "meeting v2: failed to end meeting {}, will retry: {}",
+                            meeting_id, e
+                        );
+                        pending_ends.push(meeting_id, now);
                     }
                 }
             }
@@ -3032,6 +3111,7 @@ pub async fn run_meeting_detection_loop(
                     let (meeting_id, decision_trigger) = match merge_candidate {
                         Ok(Some(recent)) => match db.reopen_meeting(recent.id).await {
                             Ok(()) => {
+                                pending_ends.forget(recent.id);
                                 info!(
                                     "meeting v2: reopened recent meeting (id={}, app={})",
                                     recent.id, app
@@ -3162,7 +3242,11 @@ pub async fn run_meeting_detection_loop(
                                 }
                             }
                             Err(e) => {
-                                error!("meeting v2: failed to end meeting {}: {}", meeting_id, e);
+                                error!(
+                                    "meeting v2: failed to end meeting {}, will retry: {}",
+                                    meeting_id, e
+                                );
+                                pending_ends.push(meeting_id, now);
                             }
                         }
                     }
@@ -3453,6 +3537,49 @@ async fn insert_new_meeting(
 
 #[cfg(test)]
 mod tests {
+
+    // ── meeting ends the database refused ──────────────────────
+
+    /// On 2026-10-08 the pool timed out when a meeting ended. The end was
+    /// logged and dropped, the row stayed open, the meeting stayed active
+    /// and the mic gate kept recording for over an hour after the call.
+    /// An end that fails is kept and written on a later scan, with the time
+    /// the call actually ended.
+    #[tokio::test]
+    async fn a_meeting_end_the_database_refused_is_written_later() {
+        let mut pending = PendingEnds::default();
+        pending.push(48, "2026-10-08T19:59:35.000Z".to_string());
+        pending.push(48, "2026-10-08T20:30:00.000Z".to_string());
+
+        let refused = pending
+            .retry(|_, _| async { Err::<(), _>("pool timed out") })
+            .await;
+        assert!(refused.is_empty());
+        assert!(!pending.is_empty(), "a refused end must be kept");
+
+        let mut written = Vec::new();
+        let ended = pending
+            .retry(|id, at| {
+                written.push((id, at));
+                async { Ok::<(), &str>(()) }
+            })
+            .await;
+        assert_eq!(ended, vec![48]);
+        assert_eq!(
+            written,
+            vec![(48, "2026-10-08T19:59:35.000Z".to_string())],
+            "written once, with the time the call ended"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reopened_meeting_drops_its_pending_end() {
+        let mut pending = PendingEnds::default();
+        pending.push(48, "2026-10-08T19:59:35.000Z".to_string());
+        pending.forget(48);
+        assert!(pending.is_empty());
+    }
     use super::*;
 
     // ── audio-gated scan cadence tests ─────────────────────────────────

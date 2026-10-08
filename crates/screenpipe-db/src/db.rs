@@ -641,7 +641,7 @@ impl DatabaseManager {
                     Ok(Err(e)) => return Err(e),
                     Err(_) => return Err(sqlx::Error::PoolTimedOut),
                 };
-            match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
+            match crate::sqlite_error::begin_immediate(&mut conn).await {
                 Ok(_) => {
                     return Ok(ImmediateTx {
                         conn: Some(conn),

@@ -515,7 +515,7 @@ async fn execute_batch(
             }
         };
 
-        match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
+        match crate::sqlite_error::begin_immediate(&mut conn).await {
             Ok(_) => {
                 conn_opt = Some(conn);
                 break;

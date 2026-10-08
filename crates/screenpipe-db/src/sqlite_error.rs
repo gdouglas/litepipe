@@ -50,6 +50,31 @@ pub(crate) fn is_sqlite_busy_error(e: &sqlx::Error) -> bool {
     }
 }
 
+/// `BEGIN IMMEDIATE` on a pooled write connection, leaving the connection
+/// clean when it is refused as busy.
+///
+/// With the SQLite that sqlx 0.7 bundles (3.41.2), a `BEGIN IMMEDIATE` refused
+/// as busy leaves its connection inside a transaction. It holds no write
+/// lock, but the next `BEGIN` on it fails with "cannot start a transaction
+/// within a transaction". Back in the pool, the broken connection reaches the
+/// next writer, which spends a retry recovering it. Under contention every
+/// write connection breaks in turn, batches run out of retries and their
+/// writes (audio chunks, UI events, meeting rows) are dropped. A busy refusal
+/// is rolled back here, on the same connection, before anyone else gets it.
+pub(crate) async fn begin_immediate(conn: &mut sqlx::SqliteConnection) -> Result<(), sqlx::Error> {
+    match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if is_sqlite_busy_error(&e) {
+                // With no transaction open, ROLLBACK only reports that, so
+                // its result is not needed.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            }
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +110,35 @@ mod tests {
         assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
             "database is locked".into(),
         )));
+    }
+
+    /// Two writers in WAL mode: A holds the write lock, so B's BEGIN is
+    /// refused as busy. Once A commits, B must be able to begin again.
+    #[tokio::test]
+    async fn a_begin_refused_as_busy_leaves_the_connection_ready() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+        use sqlx::ConnectOptions;
+        use std::time::Duration;
+
+        let path = std::env::temp_dir().join(format!("busy_begin_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_millis(100));
+        let mut a = opts.clone().connect().await.unwrap();
+        let mut b = opts.connect().await.unwrap();
+        sqlx::query("CREATE TABLE x (v INTEGER)").execute(&mut a).await.unwrap();
+
+        begin_immediate(&mut a).await.unwrap();
+        let refused = begin_immediate(&mut b).await.unwrap_err();
+        assert!(is_sqlite_busy_error(&refused), "expected busy, got {refused}");
+        sqlx::query("COMMIT").execute(&mut a).await.unwrap();
+
+        let again = begin_immediate(&mut b).await;
+        assert!(again.is_ok(), "the next BEGIN failed: {:?}", again.err());
+        sqlx::query("ROLLBACK").execute(&mut b).await.unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }

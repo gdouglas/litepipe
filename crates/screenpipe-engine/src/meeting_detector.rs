@@ -987,6 +987,21 @@ impl AttrNeeds {
 }
 
 #[cfg(target_os = "macos")]
+/// Whether a window title is the call window a `WindowTitle` signal names.
+///
+/// The title must be the name itself, or the name followed by " - " and a
+/// room or meeting name. A plain substring match also caught other Zoom
+/// windows whose titles only contain "Zoom Meeting", such as a meeting
+/// invitation's details, and held a meeting open, mic recording, with no
+/// call running. Both strings must already be lowercase.
+fn window_title_is(title_lower: &str, wanted_lower: &str) -> bool {
+    let title = title_lower.trim();
+    title == wanted_lower
+        || title
+            .strip_prefix(wanted_lower)
+            .is_some_and(|rest| rest.starts_with(" - "))
+}
+
 impl PrecomputedSignal {
     fn from_signals(signals: &[CallSignal]) -> Vec<PrecomputedSignal> {
         signals
@@ -1099,8 +1114,8 @@ fn check_signal_match(
         CallSignal::WindowTitle { title_contains } => {
             // WindowTitle is checked separately against the root window element,
             // not during descendant walking. But handle it here for completeness.
-            let needle = title_contains.to_lowercase();
-            title.is_some_and(|t| t.to_lowercase().contains(&needle))
+            let wanted = title_contains.to_lowercase();
+            title.is_some_and(|t| window_title_is(&t.to_lowercase(), &wanted))
         }
     }
 }
@@ -1156,7 +1171,7 @@ fn check_signal_match_precomputed(
         CallSignal::WindowTitle { .. } => {
             // Checked separately against root window element, not during tree walk.
             // But support it here for completeness (matches on title).
-            title_lower.is_some_and(|t| t.contains(&ps.lower[..]))
+            title_lower.is_some_and(|t| window_title_is(t, &ps.lower))
         }
     }
 }
@@ -1477,10 +1492,10 @@ fn windows_scan_process_uia(
                 let window_name_str = window_name.to_string();
                 for signal in signals {
                     if let CallSignal::WindowTitle { title_contains } = signal {
-                        if window_name_str
-                            .to_lowercase()
-                            .contains(&title_contains.to_lowercase())
-                        {
+                        if window_title_is(
+                            &window_name_str.to_lowercase(),
+                            &title_contains.to_lowercase(),
+                        ) {
                             let label =
                                 format!("window_title={} ({})", title_contains, window_name_str);
                             if !found.contains(&label) {
@@ -5171,6 +5186,23 @@ mod tests {
         ));
         // No title
         assert!(!check_signal_match(&signal, "window", None, None, None));
+        // Zoom also opens windows whose titles merely contain the phrase: a
+        // meeting invitation's details, or an article about Zoom meetings.
+        // Counting them held a meeting open, mic recording, with no call.
+        assert!(!check_signal_match(
+            &signal,
+            "window",
+            Some("Zoom Meeting (<div><p>Agenda for the weekly sync</p></div>)"),
+            None,
+            None
+        ));
+        assert!(!check_signal_match(
+            &signal,
+            "window",
+            Some("How to take notes in a Zoom Meeting"),
+            None,
+            None
+        ));
     }
 
     #[test]
